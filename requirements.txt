@@ -1,0 +1,20 @@
+fastapi[standard]>
+uvicorn[standard]
+pdfplumber
+pydantic
+python-multipart
+openai
+requests
+psycopg2-binary
+PyJWT
+python-dotenv
+
+##Stock Data
+pandas
+openpyxl
+requests
+apscheduler 
+pytz
+
+## Invoice 
+reportlab
