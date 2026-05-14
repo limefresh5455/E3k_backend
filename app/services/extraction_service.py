@@ -9,9 +9,10 @@ import pytesseract
 from openai import OpenAI
 from PIL import Image
 
-from app.config import OPENAI_API_KEY
+from app.config import OPENAI_API_KEY, TESSERACT_CMD
 
 logger = logging.getLogger("extraction_service")
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 # Placeholder values the LLM sometimes copies literally from the prompt template.
 # If the extracted value matches any of these, treat it as not extracted.

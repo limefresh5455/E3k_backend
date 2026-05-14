@@ -25,3 +25,4 @@ API_VERSION = "5.0.0"
 ERP_BASE_URL = os.getenv("ERP_BASE_URL", "https://e3k.teboag.ch:4433/e3k.Web")
 ERP_PASSWORD = os.getenv("ERP_PASSWORD")
 ERP_USERNAME = os.getenv("ERP_USERNAME")
+TESSERACT_CMD = os.getenv("TESSERACT_CMD", "/usr/bin/tesseract")
