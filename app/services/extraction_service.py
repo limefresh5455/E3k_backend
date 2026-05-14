@@ -32,6 +32,22 @@ _RECIPIENT_BLOCKLIST = {
 }
 
 _COMPANY_SUFFIX_PATTERN = r"(?:AG|GMBH|SARL|SAS|SA|SRL|KG|OHG|LIMITED|LTD|INC|BV|NV)\b"
+_GENERIC_NON_SUPPLIER_WORDS = {
+    "betrag",
+    "total",
+    "summe",
+    "mwst",
+    "ust",
+    "rabatt",
+    "rechnung",
+    "lieferschein",
+    "auftragsbestatigung",
+    "auftragsbestätigung",
+    "bestellung",
+    "datum",
+    "kundennummer",
+    "artikel",
+}
 
 SYSTEM_PROMPT = """You are a precise data extraction assistant for a Swiss hose service company (Schlauchservice Baumann GmbH).
 You receive raw text extracted from supplier order confirmation PDFs (in German) and must extract structured order data.
@@ -154,10 +170,29 @@ def _looks_like_supplier_name(text: str) -> bool:
         return False
     if "schlauchservice baumann" in lowered or "schlauch-service baumann" in lowered:
         return False
+    if lowered in _GENERIC_NON_SUPPLIER_WORDS:
+        return False
+    if re.fullmatch(r"[0-9.,/\- ]+", cleaned):
+        return False
     if re.search(_COMPANY_SUFFIX_PATTERN, cleaned, flags=re.IGNORECASE):
         return True
     # Accept shorter brand-only names if reasonably word-like.
     return bool(re.fullmatch(r"[A-Za-z0-9&.\- ]{3,60}", cleaned))
+
+
+def _is_unreliable_supplier(value: str | None) -> bool:
+    if not value:
+        return True
+    cleaned = re.sub(r"\s+", " ", str(value)).strip(" |,;:-")
+    if not cleaned:
+        return True
+    lowered = cleaned.lower()
+    if lowered in _GENERIC_NON_SUPPLIER_WORDS:
+        return True
+    if len(cleaned) <= 4 and cleaned.isalpha() and cleaned[0].isupper():
+        # Very short single-title words like "Betrag" are usually false positives.
+        return True
+    return not _looks_like_supplier_name(cleaned)
 
 
 def _candidate_from_domain(domain: str) -> str | None:
@@ -314,7 +349,11 @@ def llm_extract(pdf_text: str) -> dict:
     extracted = json.loads(raw)
     extracted = _sanitize(extracted)
 
-    if not (extracted.get("Supplier") or "").strip():
+    supplier_val = extracted.get("Supplier")
+    if _is_unreliable_supplier(supplier_val):
+        if supplier_val:
+            logger.warning("Discarding unreliable supplier from LLM: supplier=%s", supplier_val)
+        extracted["Supplier"] = None
         fallback_supplier = _fallback_supplier_from_text(pdf_text)
         if fallback_supplier:
             extracted["Supplier"] = fallback_supplier
