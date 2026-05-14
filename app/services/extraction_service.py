@@ -61,6 +61,7 @@ _GENERIC_NON_SUPPLIER_PARTS = (
     "liefertermin",
     "versand",
     "artikel",
+    "ihren",
 )
 
 SYSTEM_PROMPT = """You are a precise data extraction assistant for a Swiss hose service company (Schlauchservice Baumann GmbH).
@@ -186,6 +187,11 @@ def _looks_like_supplier_name(text: str) -> bool:
         return False
     if lowered in _GENERIC_NON_SUPPLIER_WORDS:
         return False
+    if "ihren auftrag" in lowered:
+        return False
+    # Supplier names should not start with a lowercase stray character.
+    if cleaned and cleaned[0].islower():
+        return False
     if re.fullmatch(r"[0-9.,/\- ]+", cleaned):
         return False
     if re.search(_COMPANY_SUFFIX_PATTERN, cleaned, flags=re.IGNORECASE):
@@ -202,6 +208,10 @@ def _is_unreliable_supplier(value: str | None) -> bool:
         return True
     lowered = cleaned.lower()
     if lowered in _GENERIC_NON_SUPPLIER_WORDS:
+        return True
+    if "ihren auftrag" in lowered:
+        return True
+    if cleaned and cleaned[0].islower():
         return True
     if any(part in lowered for part in _GENERIC_NON_SUPPLIER_PARTS):
         # Business words in headers/body are frequent false positives (e.g. "Ihren Auftrag").
