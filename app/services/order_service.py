@@ -6,7 +6,7 @@ import time
 
 from app.db import get_conn
 from app.services.erp_service import push_to_erp
-from app.services.extraction_service import build_summary, extract_text_from_bytes, llm_extract
+from app.services.extraction_service import build_summary, extract_order_data, extract_text_from_bytes
 from app.services.pcloud_service import pcloud_download_pdf, pcloud_get_folders, pcloud_get_view_url
 
 semaphore = asyncio.Semaphore(2)
@@ -161,7 +161,7 @@ def _run_pipeline(
         logger.info("Text extracted for file_name=%s, chars=%d", file_name, len(pdf_text))
 
         # Step 2 - LLM extraction
-        extracted = llm_extract(pdf_text)
+        extracted = extract_order_data(pdf_text, pdf_bytes)
         order_number = str(extracted.get("OurOrderNumber", ""))
         supplier = extracted.get("Supplier", "Unknown")
         logger.info(

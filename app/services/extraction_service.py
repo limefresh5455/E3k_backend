@@ -336,6 +336,41 @@ def _ocr_images_from_bytes(pdf_bytes: bytes) -> str:
     return "\n".join(ocr_parts)
 
 
+def _ocr_full_pages_from_bytes(pdf_bytes: bytes) -> str:
+    """
+    OCR full rendered PDF pages.
+
+    This catches cases where supplier text is visually present in the header,
+    but not available as selectable text and not stored as an embedded image.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page_texts: list[str] = []
+    processed_pages = 0
+    pages_with_text = 0
+    try:
+        for page in doc:
+            processed_pages += 1
+            # Render at 2x for better OCR accuracy.
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+            try:
+                text = pytesseract.image_to_string(img, lang="deu+eng").strip()
+            except pytesseract.TesseractError:
+                text = pytesseract.image_to_string(img, lang="eng").strip()
+            if text:
+                page_texts.append(text)
+                pages_with_text += 1
+    finally:
+        doc.close()
+
+    logger.info(
+        "OCR full pages completed: processed=%d, with_text=%d",
+        processed_pages,
+        pages_with_text,
+    )
+    return "\n".join(page_texts)
+
+
 def extract_text_from_bytes(pdf_bytes: bytes) -> str:
     """
     Extract all text from a PDF:
@@ -399,6 +434,33 @@ def llm_extract(pdf_text: str) -> dict:
             logger.info("Supplier fallback applied from PDF text: supplier=%s", fallback_supplier)
         else:
             logger.warning("Supplier fallback failed: no reliable sender name detected in PDF text.")
+
+    return extracted
+
+
+def extract_order_data(pdf_text: str, pdf_bytes: bytes) -> dict:
+    """
+    Run LLM extraction, then enforce supplier fallback logic.
+    If supplier is still missing/unreliable, retry using full-page OCR text.
+    """
+    extracted = llm_extract(pdf_text)
+    supplier_val = extracted.get("Supplier")
+    if not _is_unreliable_supplier(supplier_val):
+        return extracted
+
+    logger.warning("Supplier unresolved after initial extraction; trying full-page OCR fallback.")
+    ocr_page_text = _ocr_full_pages_from_bytes(pdf_bytes)
+    if not ocr_page_text.strip():
+        logger.warning("Full-page OCR produced no text.")
+        return extracted
+
+    merged_text = f"{pdf_text}\n\n=== PAGE OCR TEXT ===\n{ocr_page_text}\n=== END PAGE OCR TEXT ==="
+    fallback_supplier = _fallback_supplier_from_text(merged_text)
+    if fallback_supplier and not _is_unreliable_supplier(fallback_supplier):
+        extracted["Supplier"] = fallback_supplier
+        logger.info("Supplier recovered from full-page OCR fallback: supplier=%s", fallback_supplier)
+    else:
+        logger.warning("Supplier still unresolved after full-page OCR fallback.")
 
     return extracted
 
