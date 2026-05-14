@@ -48,6 +48,20 @@ _GENERIC_NON_SUPPLIER_WORDS = {
     "kundennummer",
     "artikel",
 }
+_GENERIC_NON_SUPPLIER_PARTS = (
+    "auftrag",
+    "bestellung",
+    "lieferschein",
+    "rechnung",
+    "datum",
+    "betrag",
+    "summe",
+    "kundennummer",
+    "kunden-nr",
+    "liefertermin",
+    "versand",
+    "artikel",
+)
 
 SYSTEM_PROMPT = """You are a precise data extraction assistant for a Swiss hose service company (Schlauchservice Baumann GmbH).
 You receive raw text extracted from supplier order confirmation PDFs (in German) and must extract structured order data.
@@ -189,6 +203,11 @@ def _is_unreliable_supplier(value: str | None) -> bool:
     lowered = cleaned.lower()
     if lowered in _GENERIC_NON_SUPPLIER_WORDS:
         return True
+    if any(part in lowered for part in _GENERIC_NON_SUPPLIER_PARTS):
+        # Business words in headers/body are frequent false positives (e.g. "Ihren Auftrag").
+        # Keep only values that also carry an explicit company suffix.
+        if not re.search(_COMPANY_SUFFIX_PATTERN, cleaned, flags=re.IGNORECASE):
+            return True
     if len(cleaned) <= 4 and cleaned.isalpha() and cleaned[0].isupper():
         # Very short single-title words like "Betrag" are usually false positives.
         return True
