@@ -25,6 +25,14 @@ _PLACEHOLDER_VALUES = {
     "customer number or null",
 }
 
+_RECIPIENT_BLOCKLIST = {
+    "schlauchservice baumann gmbh",
+    "schlauch-service baumann gmbh",
+    "schlauch service baumann gmbh",
+}
+
+_COMPANY_SUFFIX_PATTERN = r"(?:AG|GMBH|SARL|SAS|SA|SRL|KG|OHG|LIMITED|LTD|INC|BV|NV)\b"
+
 SYSTEM_PROMPT = """You are a precise data extraction assistant for a Swiss hose service company (Schlauchservice Baumann GmbH).
 You receive raw text extracted from supplier order confirmation PDFs (in German) and must extract structured order data.
 
@@ -137,6 +145,70 @@ def _sanitize(extracted: dict) -> dict:
     return extracted
 
 
+def _looks_like_supplier_name(text: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", text).strip(" |,;:-")
+    if len(cleaned) < 3:
+        return False
+    lowered = cleaned.lower()
+    if lowered in _RECIPIENT_BLOCKLIST:
+        return False
+    if "schlauchservice baumann" in lowered or "schlauch-service baumann" in lowered:
+        return False
+    if re.search(_COMPANY_SUFFIX_PATTERN, cleaned, flags=re.IGNORECASE):
+        return True
+    # Accept shorter brand-only names if reasonably word-like.
+    return bool(re.fullmatch(r"[A-Za-z0-9&.\- ]{3,60}", cleaned))
+
+
+def _candidate_from_domain(domain: str) -> str | None:
+    host = domain.lower().strip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    root = host.split(".")[0]
+    if not root or root in {"gmail", "outlook", "hotmail", "yahoo", "icloud"}:
+        return None
+    brand = re.sub(r"[^a-z0-9]+", " ", root).strip()
+    if len(brand) < 3:
+        return None
+    return " ".join(part.capitalize() for part in brand.split())
+
+
+def _fallback_supplier_from_text(pdf_text: str) -> str | None:
+    lines = [re.sub(r"\s+", " ", line).strip() for line in pdf_text.splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    # 1) Explicit sender markers.
+    for idx, line in enumerate(lines):
+        if re.search(r"\b(absender|von|lieferant|sender)\b", line, flags=re.IGNORECASE):
+            window = [line] + lines[idx + 1: idx + 4]
+            for candidate in window:
+                match = re.search(rf"([A-Za-z0-9&.\- ]+{_COMPANY_SUFFIX_PATTERN})", candidate, flags=re.IGNORECASE)
+                if match and _looks_like_supplier_name(match.group(1)):
+                    return re.sub(r"\s+", " ", match.group(1)).strip(" |,;:-")
+
+    # 2) Any visible company-style line.
+    for line in lines[:120]:
+        match = re.search(rf"([A-Za-z0-9&.\- ]+{_COMPANY_SUFFIX_PATTERN})", line, flags=re.IGNORECASE)
+        if match:
+            candidate = re.sub(r"\s+", " ", match.group(1)).strip(" |,;:-")
+            if _looks_like_supplier_name(candidate):
+                return candidate
+
+    # 3) Email / URL brand fallback.
+    domain_match = re.search(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})", pdf_text)
+    if domain_match:
+        candidate = _candidate_from_domain(domain_match.group(1))
+        if candidate and _looks_like_supplier_name(candidate):
+            return candidate
+    web_match = re.search(r"\b(?:https?://)?(?:www\.)?([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b", pdf_text)
+    if web_match:
+        candidate = _candidate_from_domain(web_match.group(1))
+        if candidate and _looks_like_supplier_name(candidate):
+            return candidate
+    return None
+
+
 def _ocr_images_from_bytes(pdf_bytes: bytes) -> str:
     """
     OCR every raster image embedded in the PDF (logos, footer bars, etc.).
@@ -240,7 +312,17 @@ def llm_extract(pdf_text: str) -> dict:
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     extracted = json.loads(raw)
-    return _sanitize(extracted)
+    extracted = _sanitize(extracted)
+
+    if not (extracted.get("Supplier") or "").strip():
+        fallback_supplier = _fallback_supplier_from_text(pdf_text)
+        if fallback_supplier:
+            extracted["Supplier"] = fallback_supplier
+            logger.info("Supplier fallback applied from PDF text: supplier=%s", fallback_supplier)
+        else:
+            logger.warning("Supplier fallback failed: no reliable sender name detected in PDF text.")
+
+    return extracted
 
 
 def _as_float(value, default: float = 0.0) -> float:
