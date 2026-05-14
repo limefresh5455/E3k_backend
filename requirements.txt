@@ -1,4 +1,4 @@
-fastapi[standard]>
+fastapi[standard]
 uvicorn[standard]
 pdfplumber
 pydantic
@@ -8,6 +8,9 @@ requests
 psycopg2-binary
 PyJWT
 python-dotenv
+
+pymupdf
+pytesseract 
 
 ##Stock Data
 pandas

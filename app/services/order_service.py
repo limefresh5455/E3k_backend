@@ -1,7 +1,10 @@
 import asyncio
+import hashlib
 import json
+import time
 
 from app.db import get_conn
+from app.services.erp_service import push_to_erp
 from app.services.extraction_service import build_summary, extract_text_from_bytes, llm_extract
 from app.services.pcloud_service import pcloud_download_pdf, pcloud_get_folders, pcloud_get_view_url
 
@@ -11,7 +14,21 @@ semaphore = asyncio.Semaphore(2)
 def is_already_processed(file_id: str) -> bool:
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM processed_files WHERE file_id = %s", (file_id,))
+    # A file is considered already processed only if it exists in BOTH:
+    # 1) processed_files guard table, and
+    # 2) orders dashboard table.
+    # This allows re-processing when orders were manually deleted.
+    cur.execute(
+        """
+        SELECT 1
+        FROM processed_files pf
+        WHERE pf.file_id = %s
+          AND EXISTS (
+              SELECT 1 FROM orders o WHERE o.file_id = pf.file_id
+          )
+        """,
+        (file_id,),
+    )
     row = cur.fetchone()
     cur.close()
     conn.close()
@@ -40,6 +57,10 @@ def _save_success(
     supplier: str,
     extracted: dict,
     summary: dict,
+    # ERP fields — optional so existing callers don't break
+    erp_record_id: str = "",
+    erp_voucher_number: str = "",
+    erp_supplier_number: str = "",
 ):
     conn = get_conn()
     cur = conn.cursor()
@@ -47,12 +68,16 @@ def _save_success(
         """
         INSERT INTO orders
             (file_id, file_name, folder_name, pdf_url, order_number,
-             supplier, status, extracted_json, summary)
-        VALUES (%s, %s, %s, %s, %s, %s, 'success', %s, %s)
+             supplier, status, extracted_json, summary,
+             erp_record_id, erp_voucher_number, erp_supplier_number)
+        VALUES (%s, %s, %s, %s, %s, %s, 'success', %s, %s, %s, %s, %s)
         ON CONFLICT (file_id) DO UPDATE SET
             status='success',
             extracted_json=EXCLUDED.extracted_json,
             summary=EXCLUDED.summary,
+            erp_record_id=EXCLUDED.erp_record_id,
+            erp_voucher_number=EXCLUDED.erp_voucher_number,
+            erp_supplier_number=EXCLUDED.erp_supplier_number,
             processed_at=NOW()
         """,
         (
@@ -64,6 +89,9 @@ def _save_success(
             supplier,
             json.dumps(extracted),
             json.dumps(summary),
+            erp_record_id,
+            erp_voucher_number,
+            erp_supplier_number,
         ),
     )
     conn.commit()
@@ -71,7 +99,13 @@ def _save_success(
     conn.close()
 
 
-def _save_failure(file_id: str, file_name: str, folder_name: str, pdf_url: str, error_message: str):
+def _save_failure(
+    file_id: str,
+    file_name: str,
+    folder_name: str,
+    pdf_url: str,
+    error_message: str,
+):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -91,55 +125,41 @@ def _save_failure(file_id: str, file_name: str, folder_name: str, pdf_url: str, 
     conn.close()
 
 
-def process_local_file(file_path: str, file_id: str, file_name: str, folder_name: str):
-    pdf_url = f"local://{file_name}"
+# ---------------------------------------------------------------------------
+# Shared pipeline core
+# ---------------------------------------------------------------------------
+
+def _run_pipeline(
+    pdf_bytes: bytes,
+    file_id: str,
+    file_name: str,
+    folder_name: str,
+    pdf_url: str,
+) -> dict:
+    """
+    Full pipeline:
+      1. Extract text from PDF bytes
+      2. LLM extraction
+      3. Push to ERP (resolve supplier -> create PurchaseOrder)
+      4. Save result to DB
+      5. Return result dict
+    """
     try:
-        with open(file_path, "rb") as file:
-            pdf_bytes = file.read()
-
-        pdf_text = extract_text_from_bytes(pdf_bytes)
-        if not pdf_text.strip():
-            raise ValueError("No text extracted")
-
-        extracted = llm_extract(pdf_text)
-        order_number = str(extracted.get("OurOrderNumber", ""))
-        supplier = extracted.get("Supplier", "Unknown")
-        summary = build_summary(extracted, file_name, folder_name)
-
-        _save_success(
-            file_id=file_id,
-            file_name=file_name,
-            folder_name=folder_name,
-            pdf_url=pdf_url,
-            order_number=order_number,
-            supplier=supplier,
-            extracted=extracted,
-            summary=summary,
-        )
-        mark_as_processed(file_id, file_name)
-        return {"status": "success", "order_number": order_number, "supplier": supplier}
-    except Exception as error:
-        try:
-            _save_failure(file_id, file_name, folder_name, pdf_url, str(error))
-            mark_as_processed(file_id, file_name)
-        except Exception:
-            pass
-        return {"status": "failure", "error": str(error)}
-
-
-def process_file(file_id: str, file_name: str, folder_name: str) -> dict:
-    pdf_url = pcloud_get_view_url(file_id)
-    try:
-        pdf_bytes = pcloud_download_pdf(file_id)
+        # Step 1 - extract text
         pdf_text = extract_text_from_bytes(pdf_bytes)
         if not pdf_text.strip():
             raise ValueError("No text could be extracted (image-based PDF?)")
 
+        # Step 2 - LLM extraction
         extracted = llm_extract(pdf_text)
         order_number = str(extracted.get("OurOrderNumber", ""))
         supplier = extracted.get("Supplier", "Unknown")
         summary = build_summary(extracted, file_name, folder_name)
 
+        # Step 3 - push to ERP
+        erp_result = push_to_erp(extracted)
+
+        # Step 4 - save success
         _save_success(
             file_id=file_id,
             file_name=file_name,
@@ -149,9 +169,21 @@ def process_file(file_id: str, file_name: str, folder_name: str) -> dict:
             supplier=supplier,
             extracted=extracted,
             summary=summary,
+            erp_record_id=erp_result.get("erp_record_id", ""),
+            erp_voucher_number=erp_result.get("voucher_number", ""),
+            erp_supplier_number=erp_result.get("supplier_number", ""),
         )
         mark_as_processed(file_id, file_name)
-        return {"status": "success", "order_number": order_number, "supplier": supplier}
+
+        return {
+            "status": "success",
+            "order_number": order_number,
+            "supplier": supplier,
+            "erp_record_id": erp_result.get("erp_record_id"),
+            "erp_voucher_number": erp_result.get("voucher_number"),
+            "erp_supplier_number": erp_result.get("supplier_number"),
+        }
+
     except Exception as error:
         try:
             _save_failure(file_id, file_name, folder_name, pdf_url, str(error))
@@ -159,6 +191,34 @@ def process_file(file_id: str, file_name: str, folder_name: str) -> dict:
         except Exception:
             pass
         return {"status": "failure", "error": str(error)}
+
+
+# ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
+
+def process_local_file(file_path: str, file_id: str, file_name: str, folder_name: str) -> dict:
+    pdf_url = f"local://{file_name}"
+    with open(file_path, "rb") as f:
+        pdf_bytes = f.read()
+    return _run_pipeline(pdf_bytes, file_id, file_name, folder_name, pdf_url)
+
+
+def process_file(file_id: str, file_name: str, folder_name: str) -> dict:
+    pdf_url = pcloud_get_view_url(file_id)
+    pdf_bytes = pcloud_download_pdf(file_id)
+    return _run_pipeline(pdf_bytes, file_id, file_name, folder_name, pdf_url)
+
+
+def process_pdf_bytes(pdf_bytes: bytes, file_name: str) -> dict:
+    """
+    Used by the manual upload endpoint in sync.py.
+    Generates a unique file_id so it never collides with pCloud entries.
+    No duplicate-check applied — user explicitly uploaded it.
+    """
+    file_id = hashlib.md5(f"{file_name}{time.time()}".encode()).hexdigest()
+    pdf_url = f"upload://{file_name}"
+    return _run_pipeline(pdf_bytes, file_id, file_name, folder_name="manual_upload", pdf_url=pdf_url)
 
 
 async def process_wrapper(file_id: str, file_name: str, folder_name: str):
@@ -170,6 +230,10 @@ async def process_wrapper(file_id: str, file_name: str, folder_name: str):
             return {"file": file_name, "folder": folder_name, "status": "failure", "error": str(error)}
 
 
+# ---------------------------------------------------------------------------
+# DB read helpers (unchanged - used by orders.py)
+# ---------------------------------------------------------------------------
+
 def list_orders():
     conn = get_conn()
     cur = conn.cursor()
@@ -177,7 +241,8 @@ def list_orders():
         """
         SELECT id, file_id, file_name, folder_name, pdf_url,
                order_number, supplier, status, error_message,
-               summary, processed_at
+               summary, erp_record_id, erp_voucher_number, erp_supplier_number,
+               processed_at
         FROM orders
         ORDER BY processed_at DESC
         """
@@ -229,4 +294,3 @@ def get_stats():
 
 async def get_pcloud_folders():
     return await asyncio.to_thread(pcloud_get_folders)
-
