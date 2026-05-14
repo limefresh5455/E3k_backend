@@ -21,6 +21,12 @@ except ImportError:
 
 logger = logging.getLogger("main")
 
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+
 ENABLE_SCHEDULER = os.getenv("ENABLE_SCHEDULER", "true").lower() == "true"
 DE_TIMEZONE = "Europe/Berlin"
 SCHEDULE_HOUR = 0

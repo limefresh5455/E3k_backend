@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import re
 
 import fitz  # PyMuPDF
@@ -9,6 +10,8 @@ from openai import OpenAI
 from PIL import Image
 
 from app.config import OPENAI_API_KEY
+
+logger = logging.getLogger("extraction_service")
 
 # Placeholder values the LLM sometimes copies literally from the prompt template.
 # If the extracted value matches any of these, treat it as not extracted.
@@ -147,6 +150,8 @@ def _ocr_images_from_bytes(pdf_bytes: bytes) -> str:
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     ocr_parts: list[str] = []
+    processed_images = 0
+    images_with_text = 0
 
     try:
         for page in doc:
@@ -158,19 +163,30 @@ def _ocr_images_from_bytes(pdf_bytes: bytes) -> str:
                     # Skip tiny decorative elements
                     if pix.width < 100 or pix.height < 30:
                         continue
+                    processed_images += 1
 
                     # Convert via encoded PNG bytes. This is more robust than raw
                     # Image.frombytes for unusual embedded image pixel formats.
                     img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-                    text = pytesseract.image_to_string(img, lang="deu+eng").strip()
+                    try:
+                        text = pytesseract.image_to_string(img, lang="deu+eng").strip()
+                    except pytesseract.TesseractError:
+                        # Fallback for hosts where German language pack is not installed.
+                        text = pytesseract.image_to_string(img, lang="eng").strip()
                     if text:
                         ocr_parts.append(text)
+                        images_with_text += 1
                 except Exception:
                     # Ignore malformed embedded images and continue processing the PDF.
                     continue
     finally:
         doc.close()
 
+    logger.info(
+        "OCR embedded images completed: processed=%d, with_text=%d",
+        processed_images,
+        images_with_text,
+    )
     return "\n".join(ocr_parts)
 
 
@@ -197,7 +213,14 @@ def extract_text_from_bytes(pdf_bytes: bytes) -> str:
     if ocr_text:
         text_parts.append(f"\n=== IMAGE TEXT (OCR) ===\n{ocr_text}\n=== END IMAGE TEXT ===")
 
-    return "\n".join(text_parts)
+    final_text = "\n".join(text_parts)
+    logger.info(
+        "PDF text extraction completed: text_chars=%d, sections=%d, has_ocr=%s",
+        len(final_text),
+        len(text_parts),
+        bool(ocr_text),
+    )
+    return final_text
 
 
 def llm_extract(pdf_text: str) -> dict:

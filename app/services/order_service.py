@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import time
 
 from app.db import get_conn
@@ -9,6 +10,7 @@ from app.services.extraction_service import build_summary, extract_text_from_byt
 from app.services.pcloud_service import pcloud_download_pdf, pcloud_get_folders, pcloud_get_view_url
 
 semaphore = asyncio.Semaphore(2)
+logger = logging.getLogger("order_service")
 
 
 def is_already_processed(file_id: str) -> bool:
@@ -145,19 +147,41 @@ def _run_pipeline(
       5. Return result dict
     """
     try:
+        logger.info(
+            "Starting PDF pipeline: file_id=%s, file_name=%s, folder=%s, pdf_url=%s",
+            file_id,
+            file_name,
+            folder_name,
+            pdf_url,
+        )
         # Step 1 - extract text
         pdf_text = extract_text_from_bytes(pdf_bytes)
         if not pdf_text.strip():
             raise ValueError("No text could be extracted (image-based PDF?)")
+        logger.info("Text extracted for file_name=%s, chars=%d", file_name, len(pdf_text))
 
         # Step 2 - LLM extraction
         extracted = llm_extract(pdf_text)
         order_number = str(extracted.get("OurOrderNumber", ""))
         supplier = extracted.get("Supplier", "Unknown")
+        logger.info(
+            "LLM extraction completed for file_name=%s, supplier=%s, order_number=%s, lines=%d",
+            file_name,
+            supplier,
+            order_number,
+            len(extracted.get("VoucherLines", [])),
+        )
         summary = build_summary(extracted, file_name, folder_name)
 
         # Step 3 - push to ERP
         erp_result = push_to_erp(extracted)
+        logger.info(
+            "ERP push succeeded for file_name=%s, supplier=%s, erp_record_id=%s, voucher_number=%s",
+            file_name,
+            supplier,
+            erp_result.get("erp_record_id"),
+            erp_result.get("voucher_number"),
+        )
 
         # Step 4 - save success
         _save_success(
@@ -185,10 +209,22 @@ def _run_pipeline(
         }
 
     except Exception as error:
+        logger.exception(
+            "PDF pipeline failed: file_id=%s, file_name=%s, folder=%s, error=%s",
+            file_id,
+            file_name,
+            folder_name,
+            str(error),
+        )
         try:
             _save_failure(file_id, file_name, folder_name, pdf_url, str(error))
             mark_as_processed(file_id, file_name)
         except Exception:
+            logger.exception(
+                "Failed to persist failure state: file_id=%s, file_name=%s",
+                file_id,
+                file_name,
+            )
             pass
         return {"status": "failure", "error": str(error)}
 
