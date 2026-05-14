@@ -238,27 +238,37 @@ def _fallback_supplier_from_text(pdf_text: str) -> str | None:
             window = [line] + lines[idx + 1: idx + 4]
             for candidate in window:
                 match = re.search(rf"([A-Za-z0-9&.\- ]+{_COMPANY_SUFFIX_PATTERN})", candidate, flags=re.IGNORECASE)
-                if match and _looks_like_supplier_name(match.group(1)):
-                    return re.sub(r"\s+", " ", match.group(1)).strip(" |,;:-")
+                if match:
+                    picked = re.sub(r"\s+", " ", match.group(1)).strip(" |,;:-")
+                    if not _is_unreliable_supplier(picked):
+                        return picked
 
-    # 2) Any visible company-style line.
-    for line in lines[:120]:
+    # 2) Top-of-document company-style line (header first; most supplier names are here).
+    for line in lines[:40]:
         match = re.search(rf"([A-Za-z0-9&.\- ]+{_COMPANY_SUFFIX_PATTERN})", line, flags=re.IGNORECASE)
         if match:
-            candidate = re.sub(r"\s+", " ", match.group(1)).strip(" |,;:-")
-            if _looks_like_supplier_name(candidate):
-                return candidate
+            picked = re.sub(r"\s+", " ", match.group(1)).strip(" |,;:-")
+            if not _is_unreliable_supplier(picked):
+                return picked
 
-    # 3) Email / URL brand fallback.
+    # 3) Any remaining company-style line.
+    for line in lines[40:120]:
+        match = re.search(rf"([A-Za-z0-9&.\- ]+{_COMPANY_SUFFIX_PATTERN})", line, flags=re.IGNORECASE)
+        if match:
+            picked = re.sub(r"\s+", " ", match.group(1)).strip(" |,;:-")
+            if not _is_unreliable_supplier(picked):
+                return picked
+
+    # 4) Email / URL brand fallback.
     domain_match = re.search(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})", pdf_text)
     if domain_match:
         candidate = _candidate_from_domain(domain_match.group(1))
-        if candidate and _looks_like_supplier_name(candidate):
+        if candidate and not _is_unreliable_supplier(candidate):
             return candidate
     web_match = re.search(r"\b(?:https?://)?(?:www\.)?([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b", pdf_text)
     if web_match:
         candidate = _candidate_from_domain(web_match.group(1))
-        if candidate and _looks_like_supplier_name(candidate):
+        if candidate and not _is_unreliable_supplier(candidate):
             return candidate
     return None
 
