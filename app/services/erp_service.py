@@ -37,6 +37,25 @@ def _parse_date_for_update(date_str: Optional[str]) -> Optional[str]:
         return None
 
 
+def _parse_date_flexible(date_str: Optional[str]) -> Optional[datetime]:
+    if not date_str:
+        return None
+    text = str(date_str).strip()
+    formats = (
+        "%d.%m.%Y",
+        "%Y-%m-%d",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def _as_float(value, default: float = 0.0) -> float:
     if value is None:
         return default
@@ -253,7 +272,12 @@ def push_to_erp(extracted: dict) -> dict:
     updated_ids: list[str] = []
     updated_pdf_numbers: list[str] = []
     unit_factor_alert_lines: list[dict] = []
+    long_delivery_alert_lines: list[dict] = []
     updated_count = 0
+    order_date_dt = None
+    order_date_raw = extracted.get("OrderDate") or extracted.get("VoucherDate")
+    if order_date_raw:
+        order_date_dt = _parse_date_flexible(order_date_raw)
 
     for pdf_line in source_lines:
         matched = _pick_best_erp_line(pdf_line, erp_lines, used_ids)
@@ -278,6 +302,18 @@ def push_to_erp(extracted: dict) -> dict:
             matched.get("Id"),
         )
         delivery_date = _parse_date_for_update(pdf_line.get("DeliveryDate") or extracted.get("DeliveryDate"))
+        raw_delivery = pdf_line.get("DeliveryDate") or extracted.get("DeliveryDate")
+        if order_date_dt and raw_delivery:
+            delivery_dt = _parse_date_flexible(raw_delivery)
+            if delivery_dt and (delivery_dt - order_date_dt).days > 7:
+                long_delivery_alert_lines.append(
+                    {
+                        "article_number": str(pdf_line.get("Number", "")).strip(),
+                        "order_date": order_date_dt.strftime("%d.%m.%Y"),
+                        "delivery_date": delivery_dt.strftime("%d.%m.%Y"),
+                        "days_after_order": (delivery_dt - order_date_dt).days,
+                    }
+                )
         base_unit_price = _effective_unit_price(pdf_line)
         unit_factor = _unit_factor(pdf_line)
         unit_price = round(base_unit_price / unit_factor, 3)
@@ -316,6 +352,23 @@ def push_to_erp(extracted: dict) -> dict:
     first_line = erp_lines[0] if erp_lines else {}
     supplier_number = str(first_line.get("VoucherAddress", "")).strip()
     supplier_name = extracted.get("Supplier", "")
+    alerts: list[dict] = []
+    if unit_factor_alert_lines:
+        alerts.append(
+            {
+                "type": "unit_factor",
+                "message": "Double-check required: Einheit/unit-factor pricing detected.",
+                "lines": unit_factor_alert_lines,
+            }
+        )
+    if long_delivery_alert_lines:
+        alerts.append(
+            {
+                "type": "delivery_date_gt_one_week",
+                "message": "Double-check required: Delivery date is more than one week after order date.",
+                "lines": long_delivery_alert_lines,
+            }
+        )
 
     return {
         "erp_record_id": updated_ids[0],
@@ -327,7 +380,7 @@ def push_to_erp(extracted: dict) -> dict:
             "updated_count": updated_count,
             "updated_ids": updated_ids,
             "updated_pdf_numbers": updated_pdf_numbers,
-            "requires_double_check": bool(unit_factor_alert_lines),
-            "alerts": unit_factor_alert_lines,
+            "requires_double_check": bool(alerts),
+            "alerts": alerts,
         },
     }

@@ -480,7 +480,48 @@ def llm_extract(pdf_text: str) -> dict:
     raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
-    extracted = json.loads(raw)
+
+    def _parse_json_strict_or_salvage(text: str) -> dict:
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Try to salvage the first JSON object if extra text/noise was appended.
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                candidate = text[start:end + 1]
+                return json.loads(candidate)
+            raise
+
+    try:
+        extracted = _parse_json_strict_or_salvage(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "LLM returned invalid JSON (first attempt). Retrying once. error=%s snippet=%s",
+            str(exc),
+            raw[:500],
+        )
+        retry = client.chat.completions.create(
+            model="gpt-4o",
+            max_tokens=4096,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        EXTRACTION_PROMPT.format(pdf_text=pdf_text)
+                        + "\n\nIMPORTANT: Return only strict valid JSON. No trailing commas, comments, or extra text."
+                    ),
+                },
+            ],
+        )
+        raw_retry = (retry.choices[0].message.content or "").strip()
+        raw_retry = re.sub(r"^```(?:json)?\s*", "", raw_retry)
+        raw_retry = re.sub(r"\s*```$", "", raw_retry)
+        extracted = _parse_json_strict_or_salvage(raw_retry)
+
     extracted = _sanitize(extracted)
 
     supplier_val = extracted.get("Supplier")
