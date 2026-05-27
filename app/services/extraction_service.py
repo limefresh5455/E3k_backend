@@ -1,18 +1,23 @@
 import io
 import json
 import logging
+import random
 import re
+import time
+from datetime import datetime, timedelta
 
 import fitz  # PyMuPDF
 import pdfplumber
 import pytesseract
-from openai import OpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI, RateLimitError
 from PIL import Image
 
 from app.config import OPENAI_API_KEY, TESSERACT_CMD
 
 logger = logging.getLogger("extraction_service")
-pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+if TESSERACT_CMD:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+    logger.info("Using Tesseract binary at: %s", TESSERACT_CMD)
 
 # Placeholder values the LLM sometimes copies literally from the prompt template.
 # If the extracted value matches any of these, treat it as not extracted.
@@ -95,6 +100,7 @@ IMPORTANT RULES:
 - "DiscountPercent": the discount percentage exactly as printed (e.g. 33, 35). Set to null if not shown.
   NEVER pre-calculate net price. NEVER put a calculated value in GrossPrice.
 - "Quantity": number of units ordered
+- "Einheit": pricing unit factor column (e.g. 1, 10, 100). If a row price is per 100 pieces, set Einheit=100.
 - "Description": the FULL product description text exactly as it appears — including dimensions, sizes,
   material codes, and any suffix (e.g. "CITERDIAL 38 L 13,30" not just "CITERDIAL 38").
   Copy every word and number of the description line verbatim.
@@ -127,6 +133,7 @@ Replace ALL placeholder comments with real extracted values from the PDF text.
       "$type": "E3k.Web.Objects.DataTransfer.VoucherLines.ArticleVoucherLine, E3k.Web.Objects.DataTransfer",
       "Number": null,
       "Quantity": 0.0,
+      "Einheit": 1,
       "GrossPrice": 0.0,
       "DiscountPercent": null,
       "Description": null,
@@ -139,6 +146,7 @@ Replace ALL placeholder comments with real extracted values from the PDF text.
 
 IMPORTANT for VoucherLines:
 - "GrossPrice" = the list/gross price printed on the PDF. Do NOT calculate or modify it.
+- "Einheit" = pricing unit factor from the table column "Einheit" (or equivalent). Common values: 1, 10, 100.
 - "DiscountPercent" = the discount % printed on the PDF (e.g. 33 or 35). Null if not shown.
 - "Description" = the COMPLETE description text, word for word, including all dimensions and codes.
 - "DescriptionUnit" = unit of measure abbreviation (e.g. "M", "ST", "KG"). Null if not shown.
@@ -407,16 +415,67 @@ def extract_text_from_bytes(pdf_bytes: bytes) -> str:
 
 def llm_extract(pdf_text: str) -> dict:
     client = OpenAI(api_key=OPENAI_API_KEY)
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        max_tokens=4096,
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": EXTRACTION_PROMPT.format(pdf_text=pdf_text)},
-        ],
-    )
+
+    max_attempts = 6
+    response = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                max_tokens=4096,
+                temperature=0,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": EXTRACTION_PROMPT.format(pdf_text=pdf_text)},
+                ],
+            )
+            break
+        except RateLimitError as exc:
+            if attempt == max_attempts:
+                raise
+            # Parse API hint like "Please try again in 2.018s."
+            wait_s = 2.0 * attempt
+            msg = str(exc)
+            m = re.search(r"try again in\s*([0-9]+(?:\.[0-9]+)?)s", msg, flags=re.IGNORECASE)
+            if m:
+                wait_s = float(m.group(1)) + 0.25
+            wait_s += random.uniform(0.0, 0.35)
+            logger.warning(
+                "OpenAI rate limit hit (attempt %d/%d). Waiting %.2fs before retry.",
+                attempt,
+                max_attempts,
+                wait_s,
+            )
+            time.sleep(wait_s)
+        except (APITimeoutError, APIConnectionError) as exc:
+            if attempt == max_attempts:
+                raise
+            wait_s = min(8.0, 1.0 * attempt) + random.uniform(0.0, 0.25)
+            logger.warning(
+                "Transient OpenAI error %s (attempt %d/%d). Waiting %.2fs before retry.",
+                type(exc).__name__,
+                attempt,
+                max_attempts,
+                wait_s,
+            )
+            time.sleep(wait_s)
+        except APIStatusError as exc:
+            if exc.status_code in {408, 409, 429, 500, 502, 503, 504} and attempt < max_attempts:
+                wait_s = min(10.0, 1.5 * attempt) + random.uniform(0.0, 0.25)
+                logger.warning(
+                    "OpenAI API status %s (attempt %d/%d). Waiting %.2fs before retry.",
+                    exc.status_code,
+                    attempt,
+                    max_attempts,
+                    wait_s,
+                )
+                time.sleep(wait_s)
+                continue
+            raise
+
+    if response is None:
+        raise RuntimeError("OpenAI extraction failed after retries.")
 
     raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -439,6 +498,130 @@ def llm_extract(pdf_text: str) -> dict:
     return extracted
 
 
+def _recover_missing_numbered_lines(pdf_text: str, extracted: dict) -> dict:
+    """
+    Recover line items from table-like PDF text when the LLM misses a row.
+    Example row:
+      2 BG1 1,00 15,00 15,00
+      Bearbeitungsgebühr
+    """
+    existing_numbers = {
+        str(line.get("Number", "")).strip().upper()
+        for line in extracted.get("VoucherLines", [])
+        if line.get("Number")
+    }
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in pdf_text.splitlines() if ln.strip()]
+    recovered = []
+
+    row_pattern = re.compile(
+        r"^\d+\s+([A-Z0-9][A-Z0-9\-_./]*)\s+(\d+,\d{2})\s+(\d+,\d{2})(?:\s+(\d+,\d{2}))?\s*$"
+    )
+
+    for idx, line in enumerate(lines):
+        match = row_pattern.match(line)
+        if not match:
+            continue
+        number = match.group(1).strip().upper()
+        if number in existing_numbers:
+            continue
+
+        qty = _as_float(match.group(2), default=1.0)
+        price = _as_float(match.group(3), default=0.0)
+        description = ""
+        if idx + 1 < len(lines):
+            nxt = lines[idx + 1]
+            # Description line is often plain text without table numeric tail.
+            if not row_pattern.match(nxt):
+                description = nxt
+
+        recovered.append(
+            {
+                "$type": "E3k.Web.Objects.DataTransfer.VoucherLines.ArticleVoucherLine, E3k.Web.Objects.DataTransfer",
+                "Number": number,
+                "Quantity": qty,
+                "GrossPrice": price,
+                "DiscountPercent": None,
+                "Description": description or f"Recovered line {number}",
+                "DescriptionUnit": None,
+                "VatCode": "01",
+                "DeliveryDate": extracted.get("DeliveryDate"),
+            }
+        )
+        existing_numbers.add(number)
+
+    if recovered:
+        extracted.setdefault("VoucherLines", []).extend(recovered)
+        logger.info("Recovered %d missing numbered line(s) from PDF text table.", len(recovered))
+
+    return extracted
+
+
+def _extract_total_from_pdf_text(pdf_text: str) -> tuple[float | None, str | None]:
+    # Prefer explicit final-total labels and support Swiss thousand separators (e.g. 1’106.60).
+    amount_pat = r"([0-9]{1,3}(?:[’'`\s][0-9]{3})*(?:[.,][0-9]{2})|[0-9]+(?:[.,][0-9]{2}))"
+    prioritized = [
+        rf"(?:Gesamttotal\s*inkl\.?\s*MWST|Gesamttotal|Grand\s*Total)\s*(CHF|EUR)\s*{amount_pat}",
+        rf"(?:Netto[- ]Betrag|Total|Gesamt)\s*(CHF|EUR)\s*{amount_pat}",
+        rf"(CHF|EUR)\s*{amount_pat}\s*(?:Gesamttotal\s*inkl\.?\s*MWST|Gesamttotal|Netto[- ]Betrag|Total|Gesamt)",
+    ]
+    for pat in prioritized:
+        matches = list(re.finditer(pat, pdf_text, flags=re.IGNORECASE))
+        if matches:
+            match = matches[-1]
+            currency = match.group(1).upper()
+            amount_text = match.group(2).replace("’", "").replace("'", "").replace("`", "").replace(" ", "")
+            amount = _as_float(amount_text, default=0.0)
+            return amount, currency
+    return None, None
+
+
+def _extract_total_from_last_pdf_page(pdf_bytes: bytes) -> tuple[float | None, str | None]:
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            if not pdf.pages:
+                return None, None
+            last_page_text = pdf.pages[-1].extract_text() or ""
+            return _extract_total_from_pdf_text(last_page_text)
+    except Exception:
+        return None, None
+
+
+def _friday_of_week_from_date(date_text: str) -> str | None:
+    try:
+        base = datetime.strptime(date_text.strip(), "%d.%m.%Y")
+    except ValueError:
+        return None
+    monday = base - timedelta(days=base.weekday())
+    friday = monday + timedelta(days=4)
+    return friday.strftime("%d.%m.%Y")
+
+
+def _apply_delivery_date_fallbacks(pdf_text: str, extracted: dict) -> dict:
+    voucher_date = extracted.get("VoucherDate")
+    fallback = None
+
+    # If text has relative-week phrases, default to Friday of voucher week.
+    if re.search(
+        r"\b(this week|diese woche|dieser woche|end of week|ende der woche|week end|wochenende)\b",
+        pdf_text,
+        flags=re.IGNORECASE,
+    ):
+        if voucher_date:
+            fallback = _friday_of_week_from_date(voucher_date)
+
+    if not fallback:
+        return extracted
+
+    if not extracted.get("DeliveryDate"):
+        extracted["DeliveryDate"] = fallback
+
+    for line in extracted.get("VoucherLines", []):
+        if not line.get("DeliveryDate"):
+            line["DeliveryDate"] = fallback
+
+    return extracted
+
+
 def extract_order_data(pdf_text: str, pdf_bytes: bytes) -> dict:
     """
     Run LLM extraction, then enforce supplier fallback logic.
@@ -446,6 +629,15 @@ def extract_order_data(pdf_text: str, pdf_bytes: bytes) -> dict:
     """
     extracted = llm_extract(pdf_text)
     supplier_val = extracted.get("Supplier")
+    extracted = _recover_missing_numbered_lines(pdf_text, extracted)
+    extracted = _apply_delivery_date_fallbacks(pdf_text, extracted)
+    total_pdf, curr_pdf = _extract_total_from_last_pdf_page(pdf_bytes)
+    if total_pdf is None:
+        total_pdf, curr_pdf = _extract_total_from_pdf_text(pdf_text)
+    if total_pdf is not None:
+        extracted["TotalNetFromPdf"] = total_pdf
+    if curr_pdf and not extracted.get("Currency"):
+        extracted["Currency"] = curr_pdf
     if not _is_unreliable_supplier(supplier_val):
         return extracted
 
@@ -463,6 +655,8 @@ def extract_order_data(pdf_text: str, pdf_bytes: bytes) -> dict:
     else:
         logger.warning("Supplier still unresolved after full-page OCR fallback.")
 
+    extracted = _recover_missing_numbered_lines(merged_text, extracted)
+    extracted = _apply_delivery_date_fallbacks(merged_text, extracted)
     return extracted
 
 
@@ -489,7 +683,10 @@ def build_summary(data: dict, file_name: str, folder_name: str) -> dict:
 
     for line in lines:
         quantity = _as_float(line.get("Quantity", 0), default=0.0)
-        unit_price = _as_float(line.get("GrossPrice", line.get("Price", 0)), default=0.0)
+        unit_price = _as_float(
+            line.get("Price", line.get("NetPrice", line.get("GrossPrice", 0))),
+            default=0.0,
+        )
         discount = line.get("DiscountPercent")
         discount_pct = _as_float(discount, default=0.0) if discount is not None else None
         effective_price = unit_price if discount_pct is None else unit_price * (1 - (discount_pct / 100.0))
@@ -508,6 +705,9 @@ def build_summary(data: dict, file_name: str, folder_name: str) -> dict:
             }
         )
 
+    total_from_pdf = data.get("TotalNetFromPdf")
+    summary_total = round(_as_float(total_from_pdf, default=total), 2) if total_from_pdf is not None else round(total, 2)
+
     return {
         "file_name": file_name,
         "folder": folder_name,
@@ -517,6 +717,6 @@ def build_summary(data: dict, file_name: str, folder_name: str) -> dict:
         "delivery_date": data.get("DeliveryDate"),
         "currency": data.get("Currency", "CHF"),
         "line_count": len(lines),
-        "total_net": round(total, 2),
+        "total_net": summary_total,
         "lines": summary_lines,
     }

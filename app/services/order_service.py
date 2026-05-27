@@ -171,8 +171,6 @@ def _run_pipeline(
             order_number,
             len(extracted.get("VoucherLines", [])),
         )
-        summary = build_summary(extracted, file_name, folder_name)
-
         # Step 3 - push to ERP
         erp_result = push_to_erp(extracted)
         logger.info(
@@ -183,6 +181,25 @@ def _run_pipeline(
             erp_result.get("voucher_number"),
         )
 
+        updated_numbers = {
+            str(n).strip().upper()
+            for n in erp_result.get("payload_sent", {}).get("updated_pdf_numbers", [])
+            if n
+        }
+        extracted_for_save = dict(extracted)
+        if updated_numbers:
+            extracted_for_save["VoucherLines"] = [
+                ln for ln in extracted.get("VoucherLines", [])
+                if str(ln.get("Number", "")).strip().upper() in updated_numbers
+            ]
+        else:
+            extracted_for_save["VoucherLines"] = extracted.get("VoucherLines", [])
+
+        summary = build_summary(extracted_for_save, file_name, folder_name)
+        erp_alerts = erp_result.get("payload_sent", {}).get("alerts", []) or []
+        summary["alerts"] = erp_alerts
+        summary["requires_double_check"] = bool(erp_result.get("payload_sent", {}).get("requires_double_check"))
+
         # Step 4 - save success
         _save_success(
             file_id=file_id,
@@ -191,7 +208,7 @@ def _run_pipeline(
             pdf_url=pdf_url,
             order_number=order_number,
             supplier=supplier,
-            extracted=extracted,
+            extracted=extracted_for_save,
             summary=summary,
             erp_record_id=erp_result.get("erp_record_id", ""),
             erp_voucher_number=erp_result.get("voucher_number", ""),

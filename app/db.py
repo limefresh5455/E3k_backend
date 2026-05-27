@@ -34,9 +34,14 @@ def init_db():
             file_name    TEXT,
             processed_at TIMESTAMPTZ DEFAULT NOW()
         );
+
+        -- Startup-safe schema sync for existing databases:
+        -- ensure new columns exist even when the table was created earlier.
+        ALTER TABLE orders ADD COLUMN IF NOT EXISTS erp_record_id TEXT;
+        ALTER TABLE orders ADD COLUMN IF NOT EXISTS erp_voucher_number TEXT;
+        ALTER TABLE orders ADD COLUMN IF NOT EXISTS erp_supplier_number TEXT;
         """
     )
     conn.commit()
     cur.close()
     conn.close()
-

@@ -353,6 +353,29 @@ def build_update_payload(
                 },
             ],
         }
+    
+    # ── Out of Stock: SKU starts with 49 → Backorder ──
+    if str(raw_sku).strip().startswith("49"):
+        backorder_msg = "Innerhalb von 3-4 Tagen lieferbar"
+
+        return {
+            "regular_price":  price_str,
+            "price":          price_str,
+            "manage_stock":   True,
+            "stock_quantity": qty,
+            "stock_status":   "onbackorder",
+            "backorders":     "notify",
+            "meta_data": [
+                {
+                    "key":   "_wclt_variation_lead_time",
+                    "value": backorder_msg,
+                },
+                {
+                    "key":   "_wclt_lead_time_backorder",
+                    "value": backorder_msg,
+                },
+            ],
+        }
 
     # ── Out of Stock: all other SKUs ──────────────
     outofstock_msg = (

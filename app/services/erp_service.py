@@ -1,229 +1,333 @@
 """
 erp_service.py
-Handles all communication with the europa3000 Web API.
+Updates existing purchase orders in europa3000 using extracted order-confirmation data.
 
-  1. Look up a supplier address number by company name  -> resolve_supplier_number()
-  2. Convert extracted PDF data into ERP payload        -> build_erp_payload()
-  3. Create a purchase order in the ERP                 -> create_purchase_order()
-  4. One-shot helper that chains all three              -> push_to_erp()
+Flow:
+  1. Build ERP purchase-order voucher number from extracted OurOrderNumber (e.g. 2600718 -> B2600718)
+  2. GET existing lines: /api/VoucherLine/{voucherNumber}
+  3. Match extracted PDF lines to ERP lines
+  4. PUT line updates to /api/VoucherLine/Update (one line at a time)
 """
 
 from datetime import datetime
+import logging
+import math
+import re
 from typing import Optional
 
 import requests
 
 from app.config import ERP_BASE_URL, ERP_PASSWORD, ERP_USERNAME
 
+logger = logging.getLogger("erp_service")
+
 
 def _auth() -> tuple[str, str]:
     return (ERP_USERNAME, ERP_PASSWORD)
 
 
-def _parse_date(date_str: Optional[str]) -> Optional[str]:
-    """Convert DD.MM.YYYY -> ISO 8601 datetime (YYYY-MM-DDT00:00:00.000Z). Returns None on failure.
-    Used for line-level DeliveryDate which the ERP expects as a full timestamp."""
+def _parse_date_for_update(date_str: Optional[str]) -> Optional[str]:
+    """Convert DD.MM.YYYY -> 'YYYY-MM-DD 00:00:00.000' for T176.F035."""
     if not date_str:
         return None
     try:
         dt = datetime.strptime(date_str.strip(), "%d.%m.%Y")
-        return dt.strftime("%Y-%m-%dT00:00:00.000Z")
+        return dt.strftime("%Y-%m-%d 00:00:00.000")
     except ValueError:
         return None
 
 
-def _parse_date_only(date_str: Optional[str]) -> Optional[str]:
-    """Convert DD.MM.YYYY -> date-only string (YYYY-MM-DD). Returns None on failure.
-    Used for header-level VoucherDate which the ERP expects without a time component."""
-    if not date_str:
-        return None
+def _as_float(value, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(" ", "").replace("'", "")
+    if "," in text and "." not in text:
+        text = text.replace(",", ".")
+    else:
+        text = text.replace(",", "")
     try:
-        dt = datetime.strptime(date_str.strip(), "%d.%m.%Y")
-        return dt.strftime("%Y-%m-%d")
-    except ValueError:
-        return None
+        return float(text)
+    except (TypeError, ValueError):
+        return default
 
 
-# ---------------------------------------------------------------------------
-# 1. Resolve supplier address number
-# ---------------------------------------------------------------------------
+def _truncate_decimals(value: float, decimals: int = 2) -> float:
+    factor = 10 ** max(decimals, 0)
+    return math.trunc(value * factor) / factor
 
-def resolve_supplier_number(supplier_name: str) -> Optional[str]:
+
+def _effective_unit_price(pdf_line: dict) -> float:
+    # Prefer explicit discounted/net price if available in extracted data.
+    explicit = pdf_line.get("Price")
+    if explicit is not None:
+        return _as_float(explicit, default=0.0)
+
+    gross = _as_float(pdf_line.get("GrossPrice", 0), default=0.0)
+    discount = pdf_line.get("DiscountPercent")
+    if discount is None:
+        return gross
+    discount_pct = _as_float(discount, default=0.0)
+    return round(gross * (1 - (discount_pct / 100.0)), 2)
+
+
+def _unit_factor(pdf_line: dict) -> float:
     """
-    Search the ERP address master with a LIKE filter on the company name.
-    Returns the F001 (address key) of the first match, or None.
+    Some suppliers quote a price per pack/base unit (e.g. Einheit=100),
+    while Quantity is in pack count. ERP expects price per single unit.
     """
-    search_value = f"%{supplier_name.strip()[:30]}%"
+    raw = (
+        pdf_line.get("Einheit")
+        or pdf_line.get("UnitFactor")
+        or pdf_line.get("PriceUnit")
+        or pdf_line.get("UnitSize")
+        or pdf_line.get("DescriptionUnit")
+    )
+    factor = _as_float(raw, default=0.0)
+    if factor > 0:
+        return factor
 
-    payload = {
-        "Fields": ["F001", "F004", "F008", "F009"],
-        "Filters": [
-            {
-                "FieldNumber": 4,   # F004 = company/last name
-                "Value": search_value,
-                "Combine": 1,       # AndClampNo
-                "Type": 3,          # Like
-            }
-        ],
-        "Sortings": [],
-    }
+    # Fallback: parse from free-text fields when extractor missed explicit column.
+    text = " ".join(
+        str(pdf_line.get(k, "") or "")
+        for k in ("Description", "Name", "AdditionalText", "UnitText")
+    )
+    # Examples matched:
+    # - "Einheit 100"
+    # - "Preis pro 100"
+    # - "/100"
+    for pat in (
+        r"\beinheit\s*[:=]?\s*(\d{1,4})\b",
+        r"\bpreis\s*(?:pro|\/)\s*(\d{1,4})\b",
+        r"/\s*(\d{1,4})\b",
+    ):
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            parsed = _as_float(m.group(1), default=0.0)
+            if parsed > 0:
+                return parsed
 
-    response = requests.post(
-        f"{ERP_BASE_URL}/api/Address/Custom",
-        json=payload,
+    return 1.0
+
+
+def _normalize_article(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (value or "").upper())
+
+
+def _build_po_voucher_number(order_number: str) -> str:
+    cleaned = (order_number or "").strip().upper()
+    if not cleaned:
+        return ""
+    return cleaned if cleaned.startswith("B") else f"B{cleaned}"
+
+
+def _get_purchase_order_lines(voucher_number_b: str) -> list[dict]:
+    response = requests.get(
+        f"{ERP_BASE_URL}/api/VoucherLine/{voucher_number_b}",
+        params={"type": "PurchaseOrder"},
         auth=_auth(),
         timeout=30,
     )
-    response.raise_for_status()
-    results = response.json()
-
-    if not results:
-        return None
-
-    return results[0].get("F001", "").strip() or None
-
-
-# ---------------------------------------------------------------------------
-# 2. Build ERP payload from extracted data
-# ---------------------------------------------------------------------------
-
-def build_erp_payload(extracted: dict, supplier_number: str) -> dict:
-    """Convert LLM-extracted dict into the PurchaseOrder NewObject payload.
-
-    Key rules that match the ERP's expected format:
-    - VoucherDate  → date-only  "YYYY-MM-DD"  (no time component)
-    - DeliveryDate → full ISO   "YYYY-MM-DDT00:00:00.000Z"  (per-line only)
-    - Top-level DeliveryDate is NOT sent; the ERP derives it from line dates.
-    - Lines carry SinglePrice (gross) + DiscountPercent separately.
-      The ERP applies the discount itself; we must NOT pre-calculate net price.
-    - VatCode is NOT included on lines (ERP rejects it at line level).
-    """
-
-    voucher_lines = []
-    for line in extracted.get("VoucherLines", []):
-        erp_line = {
-            # Always CustomArticleVoucherLine — supplier article numbers are
-            # not guaranteed to exist in the local article master.
-            "$type": (
-                "E3k.Web.Objects.DataTransfer.VoucherLines.CustomArticleVoucherLine,"
-                " E3k.Web.Objects.DataTransfer"
-            ),
-            "Number": str(line.get("Number", "")).strip(),
-            "Name": str(line.get("Description", "")).strip(),
-            "Quantity": float(line.get("Quantity", 1)),
-            # Gross (list) price — the ERP applies DiscountPercent itself.
-            # Do NOT send a pre-calculated net price here.
-            "SinglePrice": float(line.get("GrossPrice", line.get("Price", 0))),
-        }
-
-        # Only add DiscountPercent when the PDF actually shows a discount.
-        if line.get("DiscountPercent") is not None:
-            erp_line["DiscountPercent"] = float(line["DiscountPercent"])
-
-        # Unit of measure (e.g. "M" for metres, "ST" for pieces).
-        if line.get("DescriptionUnit"):
-            erp_line["DescriptionUnit"] = str(line["DescriptionUnit"])
-
-        # Per-line delivery date as full ISO timestamp.
-        line_delivery = _parse_date(line.get("DeliveryDate"))
-        if line_delivery:
-            erp_line["DeliveryDate"] = line_delivery
-
-        # VatCode intentionally omitted — the ERP does not accept it at line level.
-
-        voucher_lines.append(erp_line)
-
-    payload = {
-        "CustomerNumber": supplier_number,
-        "VoucherNumber": str(extracted.get("OurOrderNumber", "")).strip(),
-        # VoucherDate must be date-only (YYYY-MM-DD), not a full timestamp.
-        "VoucherDate": _parse_date_only(extracted.get("VoucherDate")),
-        "VoucherLines": voucher_lines,
-    }
-
-    # Store supplier's own document/order number in ExternalNumber when present.
-    external = extracted.get("SupplierVoucherNumber") or extracted.get("ExternalNumber")
-    if external:
-        payload["ExternalNumber"] = str(external).strip()
-
-    # Top-level DeliveryDate is deliberately NOT added; the ERP derives it
-    # from the earliest line-level DeliveryDate automatically.
-
-    return payload
-
-
-# ---------------------------------------------------------------------------
-# 3. Create purchase order in ERP
-# ---------------------------------------------------------------------------
-
-def create_purchase_order(payload: dict) -> dict:
-    """
-    POST /api/PurchaseOrder/NewObject
-    Returns { "record_id": "8661", "voucher_number": "2600364" } on success.
-    Raises Exception on business errors.
-    """
-    response = requests.post(
-        f"{ERP_BASE_URL}/api/PurchaseOrder/NewObject",
-        json=payload,
-        auth=_auth(),
-        timeout=30,
-    )
-    response.raise_for_status()
+    if not response.ok:
+        raise Exception(
+            f"ERP VoucherLine GET failed ({response.status_code}): {response.text[:1500]}"
+        )
     body = response.json()
+    if not isinstance(body, list):
+        raise Exception(f"ERP VoucherLine GET returned unexpected payload: {body}")
+    return body
 
-    # Success: ERP returns the Record ID as a plain JSON string e.g. "8661"
-    if isinstance(body, str):
-        return {
-            "record_id": body,
-            "voucher_number": payload.get("VoucherNumber", ""),
-        }
 
-    # Business error: ERP returns {"Message": "...", "Errors": [...]}
+def _pick_best_erp_line(pdf_line: dict, erp_lines: list[dict], used_ids: set[int]) -> Optional[dict]:
+    pdf_number = str(pdf_line.get("Number", "")).strip()
+    pdf_norm = _normalize_article(pdf_number)
+    pdf_desc = str(pdf_line.get("Description", "")).strip().lower()
+
+    candidates = []
+    for line in erp_lines:
+        line_id = line.get("Id")
+        if line_id in used_ids:
+            continue
+
+        article = str(line.get("ArticleNumber", "")).strip()
+        if not article or not article.strip():
+            continue
+
+        line_flag = int(line.get("LineFlag", 0) or 0)
+        # Only primary item lines; skip text continuation lines.
+        if line_flag != 1:
+            continue
+
+        erp_norm = _normalize_article(article)
+        erp_desc = str(line.get("Name", "")).strip().lower()
+
+        score = 0
+        if pdf_norm and erp_norm == pdf_norm:
+            score += 200
+        if pdf_norm and erp_norm.endswith(pdf_norm):
+            score += 120
+        if pdf_norm and pdf_norm.endswith(erp_norm):
+            score += 100
+
+        # Strip supplier prefix like "8590-" from ERP article number and compare again.
+        erp_trimmed = _normalize_article(re.sub(r"^[A-Z0-9]+-", "", article.upper()))
+        if pdf_norm and erp_trimmed == pdf_norm:
+            score += 150
+        if pdf_norm and erp_trimmed and pdf_norm.endswith(erp_trimmed):
+            score += 80
+
+        if pdf_desc and erp_desc:
+            overlap = sum(1 for token in pdf_desc.split() if len(token) > 3 and token in erp_desc)
+            score += min(overlap * 5, 40)
+
+        if score > 0:
+            candidates.append((score, line))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def _update_voucher_line(
+    *,
+    voucher_number_b: str,
+    erp_article_number: str,
+    delivery_date: Optional[str],
+    unit_price: float,
+    line_total: float,
+) -> str:
+    payload = {
+        "F002": voucher_number_b,
+        "F003": erp_article_number,
+        "F016": f"{_truncate_decimals(unit_price, 2):.2f}",
+        "F018": f"{line_total:.2f}",
+        # "F070": f"{unit_price:.2f}",
+    }
+    if delivery_date:
+        payload["F035"] = delivery_date
+
+    logger.info("ERP VoucherLine update payload: %s", payload)
+
+    response = requests.put(
+        f"{ERP_BASE_URL}/api/VoucherLine/Update",
+        params={"type": "PurchaseOrder"},
+        json=payload,
+        auth=_auth(),
+        timeout=30,
+    )
+    if not response.ok:
+        raise Exception(
+            f"ERP VoucherLine UPDATE failed ({response.status_code}) for article '{erp_article_number}': "
+            f"{response.text[:1500]}"
+        )
+
+    body = response.json()
+    if isinstance(body, (int, str)):
+        return str(body)
     if isinstance(body, dict) and "Message" in body:
-        raise Exception(f"ERP error: {body.get('Message')} | {body.get('Errors', [])}")
+        raise Exception(f"ERP line update error: {body.get('Message')} | {body.get('Errors', [])}")
+    return str(body)
 
-    return {"raw": body, "voucher_number": payload.get("VoucherNumber", "")}
-
-
-# ---------------------------------------------------------------------------
-# 4. One-shot helper
-# ---------------------------------------------------------------------------
 
 def push_to_erp(extracted: dict) -> dict:
     """
-    Full pipeline:
-      1. Resolve supplier address number from extracted["Supplier"]
-      2. Build ERP payload
-      3. POST to PurchaseOrder/NewObject
-      4. Return result dict
-
-    Raises ValueError if supplier cannot be resolved.
-    Raises Exception on ERP errors.
+    Update existing ERP purchase order lines (no new-object creation).
+    Keeps return shape compatible with existing frontend expectations.
     """
-    supplier_name = extracted.get("Supplier")
+    our_order_number = str(extracted.get("OurOrderNumber", "")).strip()
+    if not our_order_number:
+        raise ValueError("OurOrderNumber could not be extracted from the PDF.")
 
-    # Guard: LLM returned null or a placeholder instead of a real supplier name
-    if not supplier_name or not supplier_name.strip():
+    voucher_number_b = _build_po_voucher_number(our_order_number)
+    erp_lines = _get_purchase_order_lines(voucher_number_b)
+    if not erp_lines:
+        raise ValueError(f"No ERP lines found for purchase order '{voucher_number_b}'.")
+
+    source_lines = extracted.get("VoucherLines", []) or []
+    if not source_lines:
+        raise ValueError("No voucher lines extracted from PDF; nothing to update in ERP.")
+
+    used_ids: set[int] = set()
+    updated_ids: list[str] = []
+    updated_pdf_numbers: list[str] = []
+    unit_factor_alert_lines: list[dict] = []
+    updated_count = 0
+
+    for pdf_line in source_lines:
+        matched = _pick_best_erp_line(pdf_line, erp_lines, used_ids)
+        if not matched:
+            logger.warning(
+                "No ERP voucher line match found for extracted line number=%s description=%s",
+                pdf_line.get("Number"),
+                pdf_line.get("Description"),
+            )
+            continue
+
+        line_id = matched.get("Id")
+        if isinstance(line_id, int):
+            used_ids.add(line_id)
+
+        erp_article_number = str(matched.get("ArticleNumber", "")).strip()
+        logger.info(
+            "Matched PDF line to ERP line: pdf_number=%s, pdf_description=%s, erp_article=%s, erp_id=%s",
+            pdf_line.get("Number"),
+            pdf_line.get("Description"),
+            erp_article_number,
+            matched.get("Id"),
+        )
+        delivery_date = _parse_date_for_update(pdf_line.get("DeliveryDate") or extracted.get("DeliveryDate"))
+        base_unit_price = _effective_unit_price(pdf_line)
+        unit_factor = _unit_factor(pdf_line)
+        unit_price = round(base_unit_price / unit_factor, 3)
+        quantity = _as_float(pdf_line.get("Quantity", 0), default=0.0)
+        line_total = round(quantity * base_unit_price, 2)
+        if unit_factor != 1.0:
+            unit_factor_alert_lines.append(
+                {
+                    "article_number": str(pdf_line.get("Number", "")).strip(),
+                    "factor": unit_factor,
+                    "base_unit_price": round(base_unit_price, 4),
+                    "erp_unit_price": round(unit_price, 4),
+                }
+            )
+
+        updated_id = _update_voucher_line(
+            voucher_number_b=voucher_number_b,
+            erp_article_number=erp_article_number,
+            delivery_date=delivery_date,
+            unit_price=unit_price,
+            line_total=line_total,
+        )
+        updated_ids.append(updated_id)
+        updated_pdf_numbers.append(str(pdf_line.get("Number", "")).strip().upper())
+        updated_count += 1
+
+    if updated_count == 0:
         raise ValueError(
-            "Supplier name could not be extracted from the PDF. "
-            "Check that the PDF is text-based and contains a clear company name in the header."
+            f"No ERP lines were updated for purchase order '{voucher_number_b}'. "
+            "Check article-number mapping between PDF and ERP voucher lines."
         )
 
-    supplier_name = supplier_name.strip()
-    supplier_number = resolve_supplier_number(supplier_name)
-    if not supplier_number:
-        raise ValueError(
-            f"Supplier '{supplier_name}' was extracted from the PDF but was not found "
-            f"in the ERP address master. Add the supplier to europa3000 first."
-        )
-
-    payload = build_erp_payload(extracted, supplier_number)
-    result = create_purchase_order(payload)
+    # Keep existing response structure for frontend:
+    # - erp_record_id: use first returned update id (e.g. "41965")
+    # - voucher_number: keep original order number without forced 'B' prefix
+    first_line = erp_lines[0] if erp_lines else {}
+    supplier_number = str(first_line.get("VoucherAddress", "")).strip()
+    supplier_name = extracted.get("Supplier", "")
 
     return {
-        "erp_record_id": result.get("record_id"),
-        "voucher_number": result.get("voucher_number"),
+        "erp_record_id": updated_ids[0],
+        "voucher_number": our_order_number,
         "supplier_number": supplier_number,
         "supplier_name": supplier_name,
-        "payload_sent": payload,
+        "payload_sent": {
+            "voucher_number_b": voucher_number_b,
+            "updated_count": updated_count,
+            "updated_ids": updated_ids,
+            "updated_pdf_numbers": updated_pdf_numbers,
+            "requires_double_check": bool(unit_factor_alert_lines),
+            "alerts": unit_factor_alert_lines,
+        },
     }
