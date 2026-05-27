@@ -78,17 +78,64 @@ def _truncate_decimals(value: float, decimals: int = 2) -> float:
 
 
 def _effective_unit_price(pdf_line: dict) -> float:
-    # Prefer explicit discounted/net price if available in extracted data.
+    # 1) Prefer explicit extracted unit price from the PDF.
     explicit = pdf_line.get("Price")
     if explicit is not None:
         return _as_float(explicit, default=0.0)
 
-    gross = _as_float(pdf_line.get("GrossPrice", 0), default=0.0)
-    discount = pdf_line.get("DiscountPercent")
-    if discount is None:
-        return gross
-    discount_pct = _as_float(discount, default=0.0)
-    return round(gross * (1 - (discount_pct / 100.0)), 2)
+    # 2) If line total is available, derive exact unit price from it.
+    qty = _as_float(pdf_line.get("Quantity", 0), default=0.0)
+    line_total_raw = (
+        pdf_line.get("LineTotal")
+        or pdf_line.get("Total")
+        or pdf_line.get("Amount")
+        or pdf_line.get("LineAmount")
+    )
+    if line_total_raw is not None and qty > 0:
+        return round(_as_float(line_total_raw, default=0.0) / qty, 2)
+
+    # 3) Final fallback: use listed unit price directly from PDF (no percentage math).
+    return _as_float(pdf_line.get("GrossPrice", 0), default=0.0)
+
+
+def _resolve_surcharge_percent(pdf_line: dict, has_surcharge_column: bool = False) -> float:
+    surcharge_pct_raw = (
+        pdf_line.get("SurchargePercent")
+        or pdf_line.get("AufschlagPercent")
+    )
+    if surcharge_pct_raw is None:
+        row_text = " ".join(
+            str(pdf_line.get(k, "") or "")
+            for k in ("Description", "Name", "AdditionalText")
+        ).lower()
+        if "aufschlag" in row_text or "surcharge" in row_text:
+            surcharge_pct_raw = pdf_line.get("DiscountPercent")
+    if surcharge_pct_raw is None and has_surcharge_column:
+        surcharge_pct_raw = pdf_line.get("DiscountPercent")
+    return _as_float(surcharge_pct_raw, default=0.0)
+
+
+def _effective_line_total(pdf_line: dict, unit_price: float, has_surcharge_column: bool = False) -> tuple[float, float]:
+    # 1) Prefer explicit line total from extracted PDF columns.
+    explicit_total = (
+        pdf_line.get("LineTotal")
+        or pdf_line.get("Total")
+        or pdf_line.get("Amount")
+        or pdf_line.get("LineAmount")
+    )
+    if explicit_total is not None:
+        return round(_as_float(explicit_total, default=0.0), 2), 0.0
+
+    # 2) Fallback to qty * unit price.
+    quantity = _as_float(pdf_line.get("Quantity", 0), default=0.0)
+    base_total = round(quantity * unit_price, 2)
+
+    # 3) If surcharge is present (e.g. "Aufschlag 5.5%"), add it to total.
+    surcharge_pct = _resolve_surcharge_percent(pdf_line, has_surcharge_column=has_surcharge_column)
+    if surcharge_pct > 0:
+        return round(base_total * (1 + (surcharge_pct / 100.0)), 2), surcharge_pct
+
+    return base_total, 0.0
 
 
 def _unit_factor(pdf_line: dict) -> float:
@@ -273,7 +320,13 @@ def push_to_erp(extracted: dict) -> dict:
     updated_pdf_numbers: list[str] = []
     unit_factor_alert_lines: list[dict] = []
     long_delivery_alert_lines: list[dict] = []
+    surcharge_alert_lines: list[dict] = []
+    quantity_mismatch_alert_lines: list[dict] = []
+    updated_line_totals: dict[str, float] = {}
+    updated_line_quantities: dict[str, float] = {}
+    calculated_total = 0.0
     updated_count = 0
+    has_surcharge_column = bool(extracted.get("HasSurchargeColumn"))
     order_date_dt = None
     order_date_raw = extracted.get("OrderDate") or extracted.get("VoucherDate")
     if order_date_raw:
@@ -317,8 +370,33 @@ def push_to_erp(extracted: dict) -> dict:
         base_unit_price = _effective_unit_price(pdf_line)
         unit_factor = _unit_factor(pdf_line)
         unit_price = round(base_unit_price / unit_factor, 3)
-        quantity = _as_float(pdf_line.get("Quantity", 0), default=0.0)
-        line_total = round(quantity * base_unit_price, 2)
+        erp_quantity = _as_float(matched.get("Quantity", 0), default=0.0)
+        extracted_quantity = _as_float(pdf_line.get("Quantity", 0), default=0.0)
+        qty_for_total = erp_quantity if erp_quantity > 0 else extracted_quantity
+
+        # Build a temporary line view so total logic can use stable quantity from ERP.
+        pdf_line_for_total = dict(pdf_line)
+        pdf_line_for_total["Quantity"] = qty_for_total
+        line_total, surcharge_pct_applied = _effective_line_total(
+            pdf_line_for_total,
+            base_unit_price,
+            has_surcharge_column=has_surcharge_column,
+        )
+        pdf_num = str(pdf_line.get("Number", "")).strip().upper()
+        if pdf_num:
+            updated_line_totals[pdf_num] = line_total
+            if qty_for_total > 0:
+                updated_line_quantities[pdf_num] = qty_for_total
+        calculated_total += line_total
+
+        if erp_quantity > 0 and extracted_quantity > 0 and abs(extracted_quantity - erp_quantity) >= 1:
+            quantity_mismatch_alert_lines.append(
+                {
+                    "article_number": str(pdf_line.get("Number", "")).strip(),
+                    "extracted_quantity": extracted_quantity,
+                    "erp_quantity": erp_quantity,
+                }
+            )
         if unit_factor != 1.0:
             unit_factor_alert_lines.append(
                 {
@@ -337,7 +415,15 @@ def push_to_erp(extracted: dict) -> dict:
             line_total=line_total,
         )
         updated_ids.append(updated_id)
-        updated_pdf_numbers.append(str(pdf_line.get("Number", "")).strip().upper())
+        updated_pdf_numbers.append(pdf_num)
+        if surcharge_pct_applied > 0:
+            surcharge_alert_lines.append(
+                {
+                    "article_number": str(pdf_line.get("Number", "")).strip(),
+                    "surcharge_percent": round(surcharge_pct_applied, 2),
+                    "line_total_after_surcharge": round(line_total, 2),
+                }
+            )
         updated_count += 1
 
     if updated_count == 0:
@@ -369,6 +455,49 @@ def push_to_erp(extracted: dict) -> dict:
                 "lines": long_delivery_alert_lines,
             }
         )
+    if surcharge_alert_lines:
+        alerts.append(
+            {
+                "type": "surcharge_added",
+                "message": "Double-check required: extra charge added (e.g. 5.5%).",
+                "lines": surcharge_alert_lines,
+            }
+        )
+    if quantity_mismatch_alert_lines:
+        alerts.append(
+            {
+                "type": "quantity_mismatch",
+                "message": "Double-check required: PDF quantity differs from ERP order quantity. ERP quantity used for totals.",
+                "lines": quantity_mismatch_alert_lines,
+            }
+        )
+
+    pdf_total = extracted.get("TotalNetFromPdf")
+    pdf_total_num = _as_float(pdf_total, default=0.0) if pdf_total is not None else 0.0
+    if pdf_total_num > 0:
+        diff = round(pdf_total_num - calculated_total, 2)
+        if abs(diff) >= 0.05:
+            pct = round((diff / calculated_total) * 100.0, 2) if calculated_total > 0 else None
+            msg = "Double-check required: PDF total differs from updated line total."
+            if pct is not None and abs(pct - 5.5) <= 0.25:
+                msg = (
+                    "Double-check required: extra charge added (approx. 5.5%), "
+                    "still double-check it."
+                )
+            alerts.append(
+                {
+                    "type": "pdf_total_mismatch",
+                    "message": msg,
+                    "lines": [
+                        {
+                            "pdf_total": round(pdf_total_num, 2),
+                            "calculated_line_total": round(calculated_total, 2),
+                            "difference": diff,
+                            "difference_percent": pct,
+                        }
+                    ],
+                }
+            )
 
     return {
         "erp_record_id": updated_ids[0],
@@ -380,6 +509,8 @@ def push_to_erp(extracted: dict) -> dict:
             "updated_count": updated_count,
             "updated_ids": updated_ids,
             "updated_pdf_numbers": updated_pdf_numbers,
+            "updated_line_totals": updated_line_totals,
+            "updated_line_quantities": updated_line_quantities,
             "requires_double_check": bool(alerts),
             "alerts": alerts,
         },

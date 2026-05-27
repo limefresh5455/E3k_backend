@@ -669,6 +669,9 @@ def extract_order_data(pdf_text: str, pdf_bytes: bytes) -> dict:
     If supplier is still missing/unreliable, retry using full-page OCR text.
     """
     extracted = llm_extract(pdf_text)
+    extracted["HasSurchargeColumn"] = bool(
+        re.search(r"\b(aufschlag|surcharge)\b", pdf_text, flags=re.IGNORECASE)
+    )
     supplier_val = extracted.get("Supplier")
     extracted = _recover_missing_numbered_lines(pdf_text, extracted)
     extracted = _apply_delivery_date_fallbacks(pdf_text, extracted)

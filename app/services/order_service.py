@@ -186,12 +186,21 @@ def _run_pipeline(
             for n in erp_result.get("payload_sent", {}).get("updated_pdf_numbers", [])
             if n
         }
+        updated_line_totals = erp_result.get("payload_sent", {}).get("updated_line_totals", {}) or {}
+        updated_line_quantities = erp_result.get("payload_sent", {}).get("updated_line_quantities", {}) or {}
         extracted_for_save = dict(extracted)
         if updated_numbers:
-            extracted_for_save["VoucherLines"] = [
-                ln for ln in extracted.get("VoucherLines", [])
-                if str(ln.get("Number", "")).strip().upper() in updated_numbers
-            ]
+            filtered = []
+            for ln in extracted.get("VoucherLines", []):
+                num = str(ln.get("Number", "")).strip().upper()
+                if num in updated_numbers:
+                    ln_copy = dict(ln)
+                    if num in updated_line_totals:
+                        ln_copy["LineTotal"] = updated_line_totals[num]
+                    if num in updated_line_quantities:
+                        ln_copy["Quantity"] = updated_line_quantities[num]
+                    filtered.append(ln_copy)
+            extracted_for_save["VoucherLines"] = filtered
         else:
             extracted_for_save["VoucherLines"] = extracted.get("VoucherLines", [])
 
