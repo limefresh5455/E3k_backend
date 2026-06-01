@@ -135,6 +135,11 @@ def _effective_line_total(pdf_line: dict, unit_price: float, has_surcharge_colum
     if surcharge_pct > 0:
         return round(base_total * (1 + (surcharge_pct / 100.0)), 2), surcharge_pct
 
+    # 4) If discount is present, apply it to total.
+    discount_pct = _as_float(pdf_line.get("DiscountPercent"), default=0.0)
+    if discount_pct > 0:
+        return round(base_total * (1 - (discount_pct / 100.0)), 2), 0.0
+
     return base_total, 0.0
 
 
@@ -263,6 +268,7 @@ def _update_voucher_line(
     delivery_date: Optional[str],
     unit_price: float,
     line_total: float,
+    discount_percent: Optional[float] = None,
 ) -> str:
     payload = {
         "F002": voucher_number_b,
@@ -271,6 +277,8 @@ def _update_voucher_line(
         "F018": f"{line_total:.2f}",
         # "F070": f"{unit_price:.2f}",
     }
+    if discount_percent is not None:
+        payload["F017"] = f"{_as_float(discount_percent):.2f}"
     if delivery_date:
         payload["F035"] = delivery_date
 
@@ -413,6 +421,7 @@ def push_to_erp(extracted: dict) -> dict:
             delivery_date=delivery_date,
             unit_price=unit_price,
             line_total=line_total,
+            discount_percent=pdf_line.get("DiscountPercent"),
         )
         updated_ids.append(updated_id)
         updated_pdf_numbers.append(pdf_num)
