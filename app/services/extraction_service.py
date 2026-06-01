@@ -554,41 +554,89 @@ def _recover_missing_numbered_lines(pdf_text: str, extracted: dict) -> dict:
     lines = [re.sub(r"\s+", " ", ln).strip() for ln in pdf_text.splitlines() if ln.strip()]
     recovered = []
 
+    # Original rigid pattern (comma-based decimals, e.g., 2 BG1 1,00 15,00 15,00)
     row_pattern = re.compile(
         r"^\d+\s+([A-Z0-9][A-Z0-9\-_./]*)\s+(\d+,\d{2})\s+(\d+,\d{2})(?:\s+(\d+,\d{2}))?\s*$"
     )
 
+    # Swiss/Heizmann pattern (dots, units like Stk, optional discounts, e.g., 10 48.0384 X-08BM-08 5 Stk 9.10 67% 15.01)
+    swiss_pattern = re.compile(
+        r"^\d+\s+"
+        r"([A-Z0-9][A-Z0-9\-_./]*)\s+"
+        r"(.+?)\s+"
+        r"(\d+(?:[.,]\d+)?)\s*(?:Stk|m|STK|ST|Stk\.)?\s+"
+        r"(\d+(?:[.,]\d+)?)\s+"
+        r"(?:(\d+(?:[.,]\d+)?)%?\s+)?"
+        r"(-?\d+(?:[.,]\d+)?)\s*$"
+    )
+
     for idx, line in enumerate(lines):
         match = row_pattern.match(line)
-        if not match:
-            continue
-        number = match.group(1).strip().upper()
-        if number in existing_numbers:
+        if match:
+            number = match.group(1).strip().upper()
+            if number in existing_numbers:
+                continue
+
+            qty = _as_float(match.group(2), default=1.0)
+            price = _as_float(match.group(3), default=0.0)
+            description = ""
+            if idx + 1 < len(lines):
+                nxt = lines[idx + 1]
+                if not row_pattern.match(nxt) and not swiss_pattern.match(nxt):
+                    description = nxt
+
+            recovered.append(
+                {
+                    "$type": "E3k.Web.Objects.DataTransfer.VoucherLines.ArticleVoucherLine, E3k.Web.Objects.DataTransfer",
+                    "Number": number,
+                    "Quantity": qty,
+                    "GrossPrice": price,
+                    "DiscountPercent": None,
+                    "Description": description or f"Recovered line {number}",
+                    "DescriptionUnit": None,
+                    "VatCode": "01",
+                    "DeliveryDate": extracted.get("DeliveryDate"),
+                }
+            )
+            existing_numbers.add(number)
             continue
 
-        qty = _as_float(match.group(2), default=1.0)
-        price = _as_float(match.group(3), default=0.0)
-        description = ""
-        if idx + 1 < len(lines):
-            nxt = lines[idx + 1]
-            # Description line is often plain text without table numeric tail.
-            if not row_pattern.match(nxt):
-                description = nxt
+        match_swiss = swiss_pattern.match(line)
+        if match_swiss:
+            number = match_swiss.group(1).strip().upper()
+            if number in existing_numbers:
+                continue
 
-        recovered.append(
-            {
-                "$type": "E3k.Web.Objects.DataTransfer.VoucherLines.ArticleVoucherLine, E3k.Web.Objects.DataTransfer",
-                "Number": number,
-                "Quantity": qty,
-                "GrossPrice": price,
-                "DiscountPercent": None,
-                "Description": description or f"Recovered line {number}",
-                "DescriptionUnit": None,
-                "VatCode": "01",
-                "DeliveryDate": extracted.get("DeliveryDate"),
-            }
-        )
-        existing_numbers.add(number)
+            desc_prod = match_swiss.group(2).strip()
+            qty = match_swiss.group(3)
+            price = match_swiss.group(4)
+            discount_val = match_swiss.group(5)
+            
+            qty_f = _as_float(qty, default=1.0)
+            price_f = _as_float(price, default=0.0)
+            discount_f = _as_float(discount_val) if discount_val else None
+
+            description = desc_prod
+            # Append description from the next line if it is a text-only continuation line
+            if idx + 1 < len(lines):
+                nxt = lines[idx + 1]
+                if not row_pattern.match(nxt) and not swiss_pattern.match(nxt):
+                    description = f"{desc_prod} {nxt}"
+
+            recovered.append(
+                {
+                    "$type": "E3k.Web.Objects.DataTransfer.VoucherLines.ArticleVoucherLine, E3k.Web.Objects.DataTransfer",
+                    "Number": number,
+                    "Quantity": qty_f,
+                    "GrossPrice": price_f,
+                    "DiscountPercent": discount_f,
+                    "Description": description or f"Recovered line {number}",
+                    "DescriptionUnit": None,
+                    "VatCode": "01",
+                    "DeliveryDate": extracted.get("DeliveryDate"),
+                }
+            )
+            existing_numbers.add(number)
 
     if recovered:
         extracted.setdefault("VoucherLines", []).extend(recovered)
