@@ -711,11 +711,29 @@ def _apply_delivery_date_fallbacks(pdf_text: str, extracted: dict) -> dict:
     return extracted
 
 
+def _preprocess_merged_positions(text: str) -> str:
+    """
+    Suppliers like Heizmann sometimes have PDF layout issues where the position number
+    and the 6-digit article number are merged together (e.g. '190734399' instead of '190 734399').
+    This function splits them by inserting a space.
+    """
+    if not text:
+        return text
+    # Match a line start, optional spaces, 2 or 3 digit position number, 
+    # followed immediately by a 6-digit number starting with 48, 49, 73, 74, 38, etc.
+    pattern = re.compile(
+        r"^(\s*)(\d{2,3})(48\d{4}|49\d{4}|38\d{4}|75\d{4}|39\d{4}|51\d{4}|58\d{4}|47\d{4}|77\d{4}|74\d{4}|73\d{4})\b",
+        re.MULTILINE
+    )
+    return pattern.sub(r"\1\2 \3", text)
+
+
 def extract_order_data(pdf_text: str, pdf_bytes: bytes) -> dict:
     """
     Run LLM extraction, then enforce supplier fallback logic.
     If supplier is still missing/unreliable, retry using full-page OCR text.
     """
+    pdf_text = _preprocess_merged_positions(pdf_text)
     extracted = llm_extract(pdf_text)
     extracted["HasSurchargeColumn"] = bool(
         re.search(r"\b(aufschlag|surcharge)\b", pdf_text, flags=re.IGNORECASE)
