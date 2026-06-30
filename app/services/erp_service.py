@@ -1,14 +1,3 @@
-"""
-erp_service.py
-Updates existing purchase orders in europa3000 using extracted order-confirmation data.
-
-Flow:
-  1. Build ERP purchase-order voucher number from extracted OurOrderNumber (e.g. 2600718 -> B2600718)
-  2. GET existing lines: /api/VoucherLine/{voucherNumber}
-  3. Match extracted PDF lines to ERP lines
-  4. PUT line updates to /api/VoucherLine/Update (one line at a time)
-"""
-
 from datetime import datetime
 import logging
 import math

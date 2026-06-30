@@ -90,7 +90,7 @@ IMPORTANT RULES:
 - "CustomerNumber" is the supplier's customer number for Schlauchservice Baumann - look for "Kunden-Nr.", "Debitorennr.", "Kundennr.", "Kunden NR.", "Ihre Kunden-Nr.", "Kundennummer"
 - All dates in the output must use the format DD.MM.YYYY (e.g. 18.03.2026). Convert ALL date formats to this.
 - "DeliveryDate": the confirmed delivery/dispatch date - look for "Lieferung/Termin", "Auslieferdatum", "Versandtermin", "Lieferung", "Termin best.", "Warenausgangsdatum", "Versand-Datum", "Liefertermin"
-  * If the delivery date is given as a calendar week like "KW 11" or "KW11", convert it to the WEDNESDAY of that ISO week in the document year. Example: "KW 11" in year 2026 -> Wednesday of week 11, 2026 = 11.03.2026.
+  * If the delivery date is given as a calendar week like "KW 11" or "KW11", convert it to the FRIDAY of that ISO week in the document year. Example: "KW 11" in year 2026 -> Friday of week 11, 2026 = 13.03.2026.
   * If no delivery date is mentioned at all, set DeliveryDate to null.
 - "VoucherDate": the document/order confirmation date - look for "Datum", "Belegdatum", date next to "Auftragsbestatigung". Format as DD.MM.YYYY.
 - For VoucherLines: extract ONLY real product/article lines. Skip shipping costs, surcharge lines, freight lines, and packaging lines UNLESS they have a real article number.
@@ -503,7 +503,7 @@ def llm_extract(pdf_text: str) -> dict:
         )
         retry = client.chat.completions.create(
             model="gpt-4o",
-            max_tokens=4096,
+            max_tokens=16384,
             temperature=0,
             response_format={"type": "json_object"},
             messages=[
