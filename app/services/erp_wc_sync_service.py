@@ -13,6 +13,14 @@ logger = logging.getLogger("sync_engine")
 ERP_URL      = os.getenv("ERP_URL")
 ERP_USERNAME = os.getenv("ERP_USERNAME")
 ERP_PASSWORD = os.getenv("ERP_PASSWORD")
+ERP_BASE_URL = os.getenv("ERP_BASE_URL", "").rstrip("/")
+
+# Table number used to look up the supplier key (F020) for an article
+ERP_DELIVERY_TABLE = "66"
+
+# Fallback message used whenever the dynamic delivery time can't be
+# determined (lookup error) OR the ERP returns 0 days.
+DEFAULT_BACKORDER_MSG = "Innerhalb von 10 Tagen lieferbar"
 
 WC_BASE_URL        = os.getenv("WOOCOMMERCE_BASE_URL", "").rstrip("/")
 WC_CONSUMER_KEY    = os.getenv("WOOCOMMERCE_CONSUMER_KEY", "")
@@ -58,10 +66,96 @@ def is_backorder_sku(sku: str) -> bool:
     """
     Returns True if the article number matches the decimal format xx.xxxx
     e.g. '48.2345' — two digits, a dot, then four digits.
-    These get onbackorder (qty=0) instead of outofstock.
+    (No longer used to branch stock_status — kept for reference/compat.)
     """
     import re
     return bool(re.match(r'^\d{2}\.\d+$', str(sku).strip()))
+
+
+# ─────────────────────────────────────────────────
+# DYNAMIC DELIVERY TIME LOOKUP
+# ─────────────────────────────────────────────────
+def fetch_supplier_key(erp_id) -> str | None:
+    """
+    Step 1: GET /api/Table/{table}/{id}  (table is always 66)
+    Returns the F020 value (supplier key prefix) for the given ERP row Id,
+    or None if the lookup fails / F020 is missing.
+    """
+    if erp_id is None or not ERP_BASE_URL:
+        return None
+
+    url = f"{ERP_BASE_URL}/api/Table/{ERP_DELIVERY_TABLE}/{erp_id}"
+    try:
+        resp = requests.get(
+            url,
+            auth=(ERP_USERNAME, ERP_PASSWORD),
+            headers={"accept": "application/json"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        f020 = str(data.get("F020", "")).strip()
+        return f020 or None
+    except requests.exceptions.RequestException as exc:
+        logger.warning("[ERP] Table/%s/%s lookup failed: %s", ERP_DELIVERY_TABLE, erp_id, exc)
+        return None
+
+
+def fetch_delivery_days(supplier_key: str) -> int | None:
+    """
+    Step 2: POST /api/SupplierArticle/Key/{key}  body: ["F031"]
+    Returns the F031 value (delivery days) as an int, or None if the
+    lookup fails (e.g. '*' article numbers that the ERP rejects) or the
+    value can't be parsed.
+    """
+    if not supplier_key or not ERP_BASE_URL:
+        return None
+
+    url = f"{ERP_BASE_URL}/api/SupplierArticle/Key/{supplier_key}"
+    try:
+        resp = requests.post(
+            url,
+            auth=(ERP_USERNAME, ERP_PASSWORD),
+            headers={"accept": "application/json", "Content-Type": "application/json"},
+            json=["F031"],
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        f031_raw = data.get("F031", "")
+        return int(str(f031_raw).strip())
+    except (requests.exceptions.RequestException, ValueError, TypeError) as exc:
+        logger.warning("[ERP] SupplierArticle/Key/%s lookup failed: %s", supplier_key, exc)
+        return None
+
+
+def get_backorder_message(erp_id, raw_sku: str) -> str:
+    """
+    Resolves the dynamic backorder message for an out-of-stock article:
+      1. GET Table/66/{erp_id}                 → F020
+      2. POST SupplierArticle/Key/{F020+SKU}    → F031 (delivery days)
+
+    Falls back to DEFAULT_BACKORDER_MSG when:
+      - either lookup errors out (e.g. '*' article numbers the ERP rejects), or
+      - F031 comes back as 0.
+    """
+    supplier_key_prefix = fetch_supplier_key(erp_id)
+    if not supplier_key_prefix:
+        return DEFAULT_BACKORDER_MSG
+
+    # IMPORTANT: use the article number exactly as the ERP returned it —
+    # only trim leading/trailing whitespace padding. Do NOT strip dots,
+    # dashes, or leading '*' here — normalizing it changes the key and the
+    # SupplierArticle endpoint will return "not found" (e.g. '121-A20' must
+    # stay '121-A20', not become '121A20').
+    article_no_exact = str(raw_sku).strip()
+    article_key = f"{supplier_key_prefix}{article_no_exact}"
+    days = fetch_delivery_days(article_key)
+
+    if days and days > 0:
+        return f"Innerhalb von {days} Tagen lieferbar"
+
+    return DEFAULT_BACKORDER_MSG
 
 
 # ─────────────────────────────────────────────────
@@ -294,13 +388,18 @@ def build_update_payload(
     erp_quantity: int | None,
     erp_description: str | None = None,
     raw_sku: str = "",
+    erp_id=None,
 ) -> dict:
     """
     Builds the WooCommerce update payload.
     Stock status logic:
-      - quantity > 0                          → 'instock'
-      - quantity == 0 + SKU format xx.xxxx   → 'onbackorder' (backorders: notify)
-      - quantity == 0 + all other SKUs       → 'outofstock'
+      - quantity > 0  → 'instock'
+      - quantity <= 0 → 'onbackorder' (backorders: notify), with a dynamic
+                         "Innerhalb von N Tagen lieferbar" lead-time message
+                         resolved from the ERP (Table/66 → SupplierArticle/Key).
+                         Falls back to DEFAULT_BACKORDER_MSG on lookup error
+                         or when the ERP returns 0 days.
+    'outofstock' status is no longer used.
     Lead-time meta is set only for the relevant status key.
     """
     if erp_quantity is not None:
@@ -332,73 +431,29 @@ def build_update_payload(
             ],
         }
 
-    # ── Out of Stock: decimal SKU (xx.xxxx) → Backorder ──
-    if is_backorder_sku(raw_sku):
-        backorder_msg = "Innerhalb von 3-4 Tagen lieferbar"
-        return {
-            "regular_price":  price_str,
-            "price":          price_str,
-            "manage_stock":   True,
-            "stock_quantity": qty,
-            "stock_status":   "onbackorder",
-            "backorders":     "notify",
-            "meta_data": [
-                {
-                    "key":   "_wclt_variation_lead_time",
-                    "value": backorder_msg,
-                },
-                {
-                    "key":   "_wclt_lead_time_backorder",
-                    "value": backorder_msg,
-                },
-            ],
-        }
-    
-    # ── Out of Stock: SKU starts with 49 → Backorder ──
-    if str(raw_sku).strip().startswith("49"):
-        backorder_msg = "Innerhalb von 3-4 Tagen lieferbar"
+    # ── Out of Stock → Backorder, with dynamic delivery time ──
+    backorder_msg = get_backorder_message(erp_id, raw_sku)
 
-        return {
-            "regular_price":  price_str,
-            "price":          price_str,
-            "manage_stock":   True,
-            "stock_quantity": qty,
-            "stock_status":   "onbackorder",
-            "backorders":     "notify",
-            "meta_data": [
-                {
-                    "key":   "_wclt_variation_lead_time",
-                    "value": backorder_msg,
-                },
-                {
-                    "key":   "_wclt_lead_time_backorder",
-                    "value": backorder_msg,
-                },
-            ],
-        }
-
-    # ── Out of Stock: all other SKUs ──────────────
-    outofstock_msg = (
-        "Dieser Artikel ist heute noch nicht lagerhaltig. "
-        "Viele Artikel können wir dennoch innert Kürze ausliefern. "
-        "Bitte kontaktieren sie uns."
-    )
     return {
         "regular_price":  price_str,
         "price":          price_str,
         "manage_stock":   True,
         "stock_quantity": qty,
-        "stock_status":   "outofstock",
-        "backorders":     "no",
+        "stock_status":   "onbackorder",
+        "backorders":     "notify",
         "meta_data": [
             {
                 "key":   "_wclt_variation_lead_time",
-                "value": outofstock_msg,
+                "value": backorder_msg,
             },
             {
-                "key":   "_wclt_lead_time_outofstock",
-                "value": outofstock_msg,
+                "key":   "_wclt_lead_time_onbackorder",
+                "value": backorder_msg,
             },
+            {
+                "key":   "_wclt_variation_lead_time_onbackorder",
+                "value": backorder_msg,
+            }
         ],
     }
 
@@ -486,7 +541,10 @@ def run_sync() -> dict:
         erp_price       = erp_item.get("SalesPriceNet")
         erp_quantity    = erp_item.get("Quantity")
         erp_description = erp_item.get("DescriptionUnit")
-        payload         = build_update_payload(erp_price, erp_quantity, erp_description, raw_sku)
+        erp_id          = erp_item.get("Id")
+        payload         = build_update_payload(
+            erp_price, erp_quantity, erp_description, raw_sku, erp_id
+        )
 
         for match in matches:
             summary["wc_matched"] += 1
