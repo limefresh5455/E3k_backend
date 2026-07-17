@@ -241,7 +241,13 @@ def _pick_best_erp_line(pdf_line: dict, erp_lines: list[dict], used_ids: set[int
             overlap = sum(1 for token in pdf_desc.split() if len(token) > 3 and token in erp_desc)
             score += min(overlap * 5, 40)
 
-        if score > 0:
+        # Require a real article-number correspondence to count as a match.
+        # Description-overlap alone maxes out at 40, so this floor rejects
+        # "matches" based purely on a coincidental shared word, which previously
+        # let genuinely-unmatched PDFs sneak past the zero-match failure check
+        # below and get flagged as attention instead of failure.
+        _MIN_MATCH_SCORE = 50
+        if score >= _MIN_MATCH_SCORE:
             candidates.append((score, line))
 
     if not candidates:
@@ -294,6 +300,78 @@ def _update_voucher_line(
     return str(body)
 
 
+def push_manual_line_update(
+    *,
+    voucher_number: str,
+    article_number: str,
+    unit_price: float,
+    line_total: float,
+    discount_percent: Optional[float] = None,
+    delivery_date: Optional[str] = None,
+) -> dict:
+    """
+    Manual dashboard correction: user supplies order/voucher number, article
+    number, unit price, total, discount, and delivery date directly, and we
+    push exactly those values to the ERP. No PDF extraction, no line
+    matching, no mismatch checks — the user is the source of truth here.
+
+    voucher_number: e.g. "2601018" - the "B" prefix is added automatically
+    (same convention as the PDF pipeline), so callers should NOT prefix it themselves.
+    delivery_date: accepts "DD.MM.YYYY" or "YYYY-MM-DD" (or other formats
+    handled by _parse_date_flexible). Omit if not changing it.
+    """
+    voucher_number_b = _build_po_voucher_number(voucher_number)
+    if not voucher_number_b:
+        raise ValueError("voucher_number is required.")
+
+    article_number = str(article_number or "").strip()
+    if not article_number:
+        raise ValueError("article_number is required.")
+
+    formatted_delivery_date = None
+    if delivery_date:
+        parsed_date = _parse_date_flexible(str(delivery_date))
+        if not parsed_date:
+            raise ValueError(
+                f"Could not parse delivery_date '{delivery_date}'. Use DD.MM.YYYY or YYYY-MM-DD."
+            )
+        formatted_delivery_date = parsed_date.strftime("%Y-%m-%d 00:00:00.000")
+
+    unit_price_f = _as_float(unit_price)
+    line_total_f = _as_float(line_total)
+
+    erp_line_id = _update_voucher_line(
+        voucher_number_b=voucher_number_b,
+        erp_article_number=article_number,
+        delivery_date=formatted_delivery_date,
+        unit_price=unit_price_f,
+        line_total=line_total_f,
+        discount_percent=discount_percent,
+    )
+
+    logger.info(
+        "Manual ERP line update pushed: voucher=%s, article=%s, unit_price=%s, total=%s, discount=%s, delivery_date=%s, erp_line_id=%s",
+        voucher_number_b,
+        article_number,
+        unit_price_f,
+        line_total_f,
+        discount_percent,
+        formatted_delivery_date,
+        erp_line_id,
+    )
+
+    return {
+        "status": "success",
+        "erp_line_id": erp_line_id,
+        "voucher_number": voucher_number_b,
+        "article_number": article_number,
+        "unit_price": round(_truncate_decimals(unit_price_f, 2), 2),
+        "line_total": round(line_total_f, 2),
+        "discount_percent": discount_percent,
+        "delivery_date": formatted_delivery_date,
+    }
+
+
 def push_to_erp(extracted: dict) -> dict:
     """
     Update existing ERP purchase order lines (no new-object creation).
@@ -308,6 +386,12 @@ def push_to_erp(extracted: dict) -> dict:
     if not erp_lines:
         raise ValueError(f"No ERP lines found for purchase order '{voucher_number_b}'.")
 
+    expected_line_count = sum(
+        1
+        for line in erp_lines
+        if int(line.get("LineFlag", 0) or 0) == 1 and str(line.get("ArticleNumber", "")).strip()
+    )
+
     source_lines = extracted.get("VoucherLines", []) or []
     if not source_lines:
         raise ValueError("No voucher lines extracted from PDF; nothing to update in ERP.")
@@ -321,6 +405,7 @@ def push_to_erp(extracted: dict) -> dict:
     quantity_mismatch_alert_lines: list[dict] = []
     updated_line_totals: dict[str, float] = {}
     updated_line_quantities: dict[str, float] = {}
+    updated_line_erp_article_numbers: dict[str, str] = {}
     calculated_total = 0.0
     updated_count = 0
     has_surcharge_column = bool(extracted.get("HasSurchargeColumn"))
@@ -384,6 +469,7 @@ def push_to_erp(extracted: dict) -> dict:
             updated_line_totals[pdf_num] = line_total
             if qty_for_total > 0:
                 updated_line_quantities[pdf_num] = qty_for_total
+            updated_line_erp_article_numbers[pdf_num] = erp_article_number
         calculated_total += line_total
 
         if erp_quantity > 0 and extracted_quantity > 0 and abs(extracted_quantity - erp_quantity) >= 1:
@@ -470,6 +556,37 @@ def push_to_erp(extracted: dict) -> dict:
             }
         )
 
+    recovered_line_count = int(extracted.get("RecoveredLineCount", 0) or 0)
+    if recovered_line_count > 0:
+        alerts.append(
+            {
+                "type": "lines_recovered_via_fallback",
+                "message": (
+                    "Double-check required: initial extraction missed line(s) that a fallback "
+                    "text-table parser had to recover."
+                ),
+                "lines": [{"recovered_line_count": recovered_line_count}],
+            }
+        )
+
+    if updated_count < expected_line_count:
+        alerts.append(
+            {
+                "type": "fewer_lines_than_expected",
+                "message": (
+                    "Double-check required: fewer PDF lines were matched/updated than the "
+                    "ERP purchase order actually has - some rows may be missing."
+                ),
+                "lines": [
+                    {
+                        "updated_line_count": updated_count,
+                        "expected_line_count": expected_line_count,
+                        "extracted_line_count": len(source_lines),
+                    }
+                ],
+            }
+        )
+
     pdf_total = extracted.get("TotalNetFromPdf")
     pdf_total_num = _as_float(pdf_total, default=0.0) if pdf_total is not None else 0.0
     if pdf_total_num > 0:
@@ -502,6 +619,7 @@ def push_to_erp(extracted: dict) -> dict:
         "voucher_number": our_order_number,
         "supplier_number": supplier_number,
         "supplier_name": supplier_name,
+        "erp_article_numbers": ", ".join(dict.fromkeys(updated_line_erp_article_numbers.values())),
         "payload_sent": {
             "voucher_number_b": voucher_number_b,
             "updated_count": updated_count,
@@ -509,6 +627,7 @@ def push_to_erp(extracted: dict) -> dict:
             "updated_pdf_numbers": updated_pdf_numbers,
             "updated_line_totals": updated_line_totals,
             "updated_line_quantities": updated_line_quantities,
+            "updated_line_erp_article_numbers": updated_line_erp_article_numbers,
             "requires_double_check": bool(alerts),
             "alerts": alerts,
         },

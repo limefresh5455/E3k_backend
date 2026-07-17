@@ -1,14 +1,20 @@
 import asyncio
+from typing import Optional
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from pydantic import BaseModel, Field
 
 from app.config import LOCAL_PDF_MODE, OPENAI_API_KEY
+from app.services.erp_service import push_manual_line_update
 from app.services.order_service import (
+    get_order,
+    get_order_by_number,
     get_pcloud_folders,
     is_already_processed,
     process_file,
     process_local_file,
     process_pdf_bytes,
+    update_order_line_after_manual_correction,
 )
 from app.services.pcloud_service import get_local_pdfs
 
@@ -25,6 +31,7 @@ async def sync_pcloud():
         "skipped": 0,
         "processed": 0,
         "success": 0,
+        "attention": 0,
         "failure": 0,
         "details": [],
     }
@@ -91,6 +98,8 @@ async def sync_pcloud():
 
         if response["status"] == "success":
             results["success"] += 1
+        elif response["status"] == "attention":
+            results["attention"] += 1
         else:
             results["failure"] += 1
 
@@ -137,3 +146,87 @@ async def upload_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=422, detail=result)
 
     return result
+
+
+class UpdateOrderLineRequest(BaseModel):
+    order_id: Optional[int] = Field(
+        None, description="Unique dashboard order id (preferred way to locate the order). "
+        "Provide this or voucher_number."
+    )
+    voucher_number: Optional[str] = Field(
+        None, description="Order/voucher number as shown on the PDF, e.g. '2601018'. "
+        "Used to locate the order if order_id isn't given. "
+        "The 'B' prefix required by the ERP (e.g. 'B2601018') is added automatically — do not include it."
+    )
+    erp_article_no: str = Field(
+        ..., description="ERP article number for the line being corrected. Sent to the ERP as F003, "
+        "and also used to find/update the matching line already stored on the order."
+    )
+    unit_price: float = Field(..., description="Corrected unit price.")
+    total: float = Field(..., description="Corrected line total.")
+    discount_percent: Optional[float] = Field(None, description="Corrected discount percent, if any.")
+    delivery_date: Optional[str] = Field(
+        None, description="Corrected delivery date, 'DD.MM.YYYY' or 'YYYY-MM-DD'. Omit to leave unchanged."
+    )
+
+
+@router.post("/api/update-order-line")
+async def update_order_line(payload: UpdateOrderLineRequest):
+    """
+    Manual dashboard correction: push user-entered values for a single ERP
+    purchase-order line directly to europa3000, then sync the same values
+    back into the stored order row so the dashboard reflects the fix.
+
+    The order is located by order_id (preferred, unique) or voucher_number.
+    The specific line within that order is located by erp_article_no —
+    NOT by the PDF's own line number — since that's the value guaranteed
+    to already be stored on every line the pipeline has pushed to the ERP.
+    """
+    if not payload.order_id and not payload.voucher_number:
+        raise HTTPException(status_code=400, detail="Provide either order_id or voucher_number.")
+
+    if payload.order_id:
+        order = await asyncio.to_thread(get_order, payload.order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail=f"Order id {payload.order_id} not found.")
+    else:
+        order = await asyncio.to_thread(get_order_by_number, payload.voucher_number)
+        if not order:
+            raise HTTPException(status_code=404, detail=f"Order number '{payload.voucher_number}' not found.")
+
+    voucher_number_for_erp = order.get("order_number") or payload.voucher_number
+
+    try:
+        erp_result = await asyncio.to_thread(
+            push_manual_line_update,
+            voucher_number=voucher_number_for_erp,
+            article_number=payload.erp_article_no,
+            unit_price=payload.unit_price,
+            line_total=payload.total,
+            discount_percent=payload.discount_percent,
+            delivery_date=payload.delivery_date,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except Exception as error:
+        raise HTTPException(status_code=422, detail=str(error))
+
+    # ERP push succeeded. Now reflect it in the stored order row. If the DB
+    # sync fails for any reason, the ERP has already been corrected — surface
+    # the sync failure as a warning rather than losing that fact.
+    try:
+        await asyncio.to_thread(
+            update_order_line_after_manual_correction,
+            order["id"],
+            payload.erp_article_no,
+            unit_price=payload.unit_price,
+            line_total=payload.total,
+            discount_percent=payload.discount_percent,
+            delivery_date=payload.delivery_date,
+        )
+    except Exception as error:
+        erp_result["db_sync_warning"] = str(error)
+        return erp_result
+
+    erp_result["order_id"] = order["id"]
+    return erp_result

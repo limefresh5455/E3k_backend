@@ -642,6 +642,10 @@ def _recover_missing_numbered_lines(pdf_text: str, extracted: dict) -> dict:
         extracted.setdefault("VoucherLines", []).extend(recovered)
         logger.info("Recovered %d missing numbered line(s) from PDF text table.", len(recovered))
 
+    # Metadata only - does not change any extracted value. Lets downstream code
+    # flag "LLM missed rows that a regex fallback had to recover" for manual review.
+    extracted["RecoveredLineCount"] = extracted.get("RecoveredLineCount", 0) + len(recovered)
+
     return extracted
 
 

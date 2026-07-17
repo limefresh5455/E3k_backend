@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import time
+from datetime import datetime, timezone
 
 from app.db import get_conn
 from app.services.erp_service import push_to_erp
@@ -63,6 +64,12 @@ def _save_success(
     erp_record_id: str = "",
     erp_voucher_number: str = "",
     erp_supplier_number: str = "",
+    erp_article_no: str = "",
+    # New: real numeric-mismatch review flag — optional so existing callers don't break
+    attention: bool = False,
+    attention_reasons: list = None,
+    # status is 'success' normally, or 'attention' when attention=True — needs manual review
+    status: str = "success",
 ):
     conn = get_conn()
     cur = conn.cursor()
@@ -71,15 +78,19 @@ def _save_success(
         INSERT INTO orders
             (file_id, file_name, folder_name, pdf_url, order_number,
              supplier, status, extracted_json, summary,
-             erp_record_id, erp_voucher_number, erp_supplier_number)
-        VALUES (%s, %s, %s, %s, %s, %s, 'success', %s, %s, %s, %s, %s)
+             erp_record_id, erp_voucher_number, erp_supplier_number, erp_article_no,
+             attention, attention_reasons)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (file_id) DO UPDATE SET
-            status='success',
+            status=EXCLUDED.status,
             extracted_json=EXCLUDED.extracted_json,
             summary=EXCLUDED.summary,
             erp_record_id=EXCLUDED.erp_record_id,
             erp_voucher_number=EXCLUDED.erp_voucher_number,
             erp_supplier_number=EXCLUDED.erp_supplier_number,
+            erp_article_no=EXCLUDED.erp_article_no,
+            attention=EXCLUDED.attention,
+            attention_reasons=EXCLUDED.attention_reasons,
             processed_at=NOW()
         """,
         (
@@ -89,11 +100,15 @@ def _save_success(
             pdf_url,
             order_number,
             supplier,
+            status,
             json.dumps(extracted),
             json.dumps(summary),
             erp_record_id,
             erp_voucher_number,
             erp_supplier_number,
+            erp_article_no,
+            attention,
+            json.dumps(attention_reasons or []),
         ),
     )
     conn.commit()
@@ -188,6 +203,9 @@ def _run_pipeline(
         }
         updated_line_totals = erp_result.get("payload_sent", {}).get("updated_line_totals", {}) or {}
         updated_line_quantities = erp_result.get("payload_sent", {}).get("updated_line_quantities", {}) or {}
+        updated_line_erp_article_numbers = (
+            erp_result.get("payload_sent", {}).get("updated_line_erp_article_numbers", {}) or {}
+        )
         extracted_for_save = dict(extracted)
         if updated_numbers:
             filtered = []
@@ -199,6 +217,8 @@ def _run_pipeline(
                         ln_copy["LineTotal"] = updated_line_totals[num]
                     if num in updated_line_quantities:
                         ln_copy["Quantity"] = updated_line_quantities[num]
+                    if num in updated_line_erp_article_numbers:
+                        ln_copy["ErpArticleNumber"] = updated_line_erp_article_numbers[num]
                     filtered.append(ln_copy)
             extracted_for_save["VoucherLines"] = filtered
         else:
@@ -208,6 +228,24 @@ def _run_pipeline(
         erp_alerts = erp_result.get("payload_sent", {}).get("alerts", []) or []
         summary["alerts"] = erp_alerts
         summary["requires_double_check"] = bool(erp_result.get("payload_sent", {}).get("requires_double_check"))
+
+        # attention is intentionally narrower than requires_double_check / alerts above.
+        # Those keep working exactly as before (unit-factor, quantity, surcharge,
+        # delivery-date-over-a-week all still show up as warnings on the order).
+        # attention is ONLY set for the two things that should actually pull the client's
+        # eye to the dashboard:
+        #   1. format/pricing mismatch  -> PDF total doesn't match the calculated total
+        #   2. fewer lines than expected -> some PDF/PO lines are missing or were only
+        #      recovered via the fallback text-table parser
+        _ATTENTION_ALERT_TYPES = {
+            "pdf_total_mismatch",
+            "fewer_lines_than_expected",
+            "lines_recovered_via_fallback",
+        }
+        attention_alerts = [a for a in erp_alerts if a.get("type") in _ATTENTION_ALERT_TYPES]
+        attention = bool(attention_alerts)
+        attention_reasons = [a.get("message", a.get("type", "")) for a in attention_alerts]
+        order_status = "attention" if attention else "success"
 
         # Step 4 - save success
         _save_success(
@@ -222,16 +260,23 @@ def _run_pipeline(
             erp_record_id=erp_result.get("erp_record_id", ""),
             erp_voucher_number=erp_result.get("voucher_number", ""),
             erp_supplier_number=erp_result.get("supplier_number", ""),
+            erp_article_no=erp_result.get("erp_article_numbers", ""),
+            attention=attention,
+            attention_reasons=attention_reasons,
+            status=order_status,
         )
         mark_as_processed(file_id, file_name)
 
         return {
-            "status": "success",
+            "status": order_status,
+            "attention": attention,
+            "attention_reasons": attention_reasons,
             "order_number": order_number,
             "supplier": supplier,
             "erp_record_id": erp_result.get("erp_record_id"),
             "erp_voucher_number": erp_result.get("voucher_number"),
             "erp_supplier_number": erp_result.get("supplier_number"),
+            "erp_article_no": erp_result.get("erp_article_numbers"),
         }
 
     except Exception as error:
@@ -252,7 +297,7 @@ def _run_pipeline(
                 file_name,
             )
             pass
-        return {"status": "failure", "error": str(error)}
+        return {"status": "failure", "attention": False, "attention_reasons": [], "error": str(error)}
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +348,8 @@ def list_orders():
         """
         SELECT id, file_id, file_name, folder_name, pdf_url,
                order_number, supplier, status, error_message,
-               summary, erp_record_id, erp_voucher_number, erp_supplier_number,
+               summary, erp_record_id, erp_voucher_number, erp_supplier_number, erp_article_no,
+               attention, attention_reasons,
                processed_at
         FROM orders
         ORDER BY processed_at DESC
@@ -335,6 +381,87 @@ def get_order_by_number(order_number: str):
     return dict(row) if row else None
 
 
+def update_order_line_after_manual_correction(
+    order_id: int,
+    erp_article_no: str,
+    *,
+    unit_price: float,
+    line_total: float,
+    discount_percent: float = None,
+    delivery_date: str = None,
+) -> dict:
+    """
+    After a manual /api/update-order-line push to the ERP succeeds, reflect the
+    corrected values back into the stored order row - both extracted_json.VoucherLines
+    and summary.lines - so the dashboard shows the fix without needing a re-sync.
+
+    Matched by ErpArticleNumber (the ERP article number, F003), NOT by the PDF's
+    own line "Number" field, since erp_article_no is the value the user actually
+    provided and is guaranteed present on every line the pipeline has pushed to ERP.
+    order_id is used to locate the row since it's unique.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM orders WHERE id = %s FOR UPDATE", (order_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        raise ValueError(f"Order id {order_id} not found.")
+
+    order = dict(row)
+    extracted = order.get("extracted_json") or {}
+    summary = order.get("summary") or {}
+    target = str(erp_article_no or "").strip().upper()
+
+    matched_line = None
+    for ln in extracted.get("VoucherLines", []):
+        if str(ln.get("ErpArticleNumber", "")).strip().upper() == target:
+            matched_line = ln
+            break
+
+    if matched_line is None:
+        cur.close()
+        conn.close()
+        raise ValueError(
+            f"No line with erp_article_no='{erp_article_no}' found on order id {order_id}. "
+            "The ERP was still updated; only the dashboard record could not be synced."
+        )
+
+    matched_line["GrossPrice"] = unit_price
+    matched_line["LineTotal"] = line_total
+    if discount_percent is not None:
+        matched_line["DiscountPercent"] = discount_percent
+    if delivery_date:
+        matched_line["DeliveryDate"] = delivery_date
+    matched_line["ManuallyCorrectedAt"] = datetime.now(timezone.utc).isoformat()
+
+    # Keep summary.lines in sync too (matched via the PDF number on the line we just found).
+    pdf_number = str(matched_line.get("Number", "")).strip()
+    for summary_line in summary.get("lines", []):
+        if str(summary_line.get("number", "")).strip() == pdf_number:
+            summary_line["unit_price"] = round(float(unit_price), 2)
+            summary_line["line_total"] = round(float(line_total), 2)
+            if discount_percent is not None:
+                summary_line["discount_percent"] = discount_percent
+            if delivery_date:
+                summary_line["delivery_date"] = delivery_date
+            break
+
+    summary["total_net"] = round(
+        sum(float(sl.get("line_total") or 0) for sl in summary.get("lines", [])), 2
+    )
+
+    cur.execute(
+        "UPDATE orders SET extracted_json = %s, summary = %s, processed_at = NOW() WHERE id = %s",
+        (json.dumps(extracted), json.dumps(summary), order_id),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    return order
+
+
 def get_stats():
     conn = get_conn()
     cur = conn.cursor()
@@ -343,6 +470,7 @@ def get_stats():
         SELECT
             COUNT(*) AS total,
             SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success,
+            SUM(CASE WHEN status='attention' THEN 1 ELSE 0 END) AS attention,
             SUM(CASE WHEN status='failure' THEN 1 ELSE 0 END) AS failure,
             COUNT(DISTINCT supplier) AS suppliers
         FROM orders
