@@ -13,6 +13,7 @@ from datetime import datetime
 import logging
 import math
 import re
+import time
 from typing import Optional
 
 import requests
@@ -21,9 +22,86 @@ from app.config import ERP_BASE_URL, ERP_PASSWORD, ERP_USERNAME
 
 logger = logging.getLogger("erp_service")
 
+# ─────────────────────────────────────────────────
+# ERP call resilience settings
+# The ERP (teboag.ch) API endpoints can be slow/unresponsive under load.
+# Instead of failing immediately after a single 30s timeout, we retry with
+# increasing wait times, and honor Retry-After if the ERP ever sends one.
+# ─────────────────────────────────────────────────
+ERP_REQUEST_TIMEOUT = 120          # was 30 — give slow-but-working calls more room
+ERP_MAX_RETRIES = 5                # total attempts per call
+ERP_BASE_BACKOFF = 15               # seconds, doubles each retry
+ERP_MAX_BACKOFF = 120                # cap the wait between retries
+
 
 def _auth() -> tuple[str, str]:
     return (ERP_USERNAME, ERP_PASSWORD)
+
+
+def _erp_backoff_seconds(attempt: int, response: Optional[requests.Response] = None) -> int:
+    """Compute wait time before next retry, honoring Retry-After if present."""
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return int(float(retry_after))
+            except ValueError:
+                pass
+    return min(ERP_BASE_BACKOFF * (2 ** attempt), ERP_MAX_BACKOFF)
+
+
+def _erp_request(method: str, url: str, *, context: str, **kwargs) -> requests.Response:
+    """
+    Shared GET/PUT caller with timeout + retry/backoff for the ERP API.
+    Retries on: connection errors, read timeouts, 429, and 5xx responses.
+    Raises the final exception/response error if all retries are exhausted.
+    """
+    kwargs.setdefault("timeout", ERP_REQUEST_TIMEOUT)
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(ERP_MAX_RETRIES):
+        try:
+            response = requests.request(method, url, **kwargs)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+            if attempt < ERP_MAX_RETRIES - 1:
+                wait = _erp_backoff_seconds(attempt)
+                logger.warning(
+                    "ERP %s timeout/connection error on %s (attempt %d/%d): %s — retrying in %ds",
+                    method, context, attempt + 1, ERP_MAX_RETRIES, exc, wait,
+                )
+                time.sleep(wait)
+                continue
+            logger.error(
+                "ERP %s failed after %d attempts on %s: %s",
+                method, ERP_MAX_RETRIES, context, exc,
+            )
+            raise Exception(
+                f"ERP {method} request to '{context}' timed out after {ERP_MAX_RETRIES} attempts "
+                f"({ERP_REQUEST_TIMEOUT}s each). The ERP server may be slow or unavailable. "
+                f"Last error: {exc}"
+            ) from exc
+
+        if response.status_code == 429 or response.status_code >= 500:
+            if attempt < ERP_MAX_RETRIES - 1:
+                wait = _erp_backoff_seconds(attempt, response)
+                logger.warning(
+                    "ERP %s got %d on %s (attempt %d/%d) — retrying in %ds",
+                    method, response.status_code, context, attempt + 1, ERP_MAX_RETRIES, wait,
+                )
+                time.sleep(wait)
+                continue
+            raise Exception(
+                f"ERP {method} request to '{context}' failed after {ERP_MAX_RETRIES} attempts "
+                f"(last status {response.status_code}): {response.text[:1500]}"
+            )
+
+        return response
+
+    # Should not be reached, but keeps type-checkers happy.
+    if last_exc:
+        raise last_exc
+    raise Exception(f"ERP {method} request to '{context}' failed for an unknown reason.")
 
 
 def _parse_date_for_update(date_str: Optional[str]) -> Optional[str]:
@@ -189,11 +267,13 @@ def _build_po_voucher_number(order_number: str) -> str:
 
 
 def _get_purchase_order_lines(voucher_number_b: str) -> list[dict]:
-    response = requests.get(
-        f"{ERP_BASE_URL}/api/VoucherLine/{voucher_number_b}",
+    url = f"{ERP_BASE_URL}/api/VoucherLine/{voucher_number_b}"
+    response = _erp_request(
+        "GET",
+        url,
+        context=f"VoucherLine/{voucher_number_b}",
         params={"type": "PurchaseOrder"},
         auth=_auth(),
-        timeout=30,
     )
     if not response.ok:
         raise Exception(
@@ -276,12 +356,14 @@ def _update_voucher_line(
 
     logger.info("ERP VoucherLine update payload: %s", payload)
 
-    response = requests.put(
-        f"{ERP_BASE_URL}/api/VoucherLine/Update",
+    url = f"{ERP_BASE_URL}/api/VoucherLine/Update"
+    response = _erp_request(
+        "PUT",
+        url,
+        context=f"VoucherLine/Update (article={erp_article_number})",
         params={"type": "PurchaseOrder"},
         json=payload,
         auth=_auth(),
-        timeout=30,
     )
     if not response.ok:
         raise Exception(
