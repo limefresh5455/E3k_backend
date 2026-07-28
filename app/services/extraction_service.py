@@ -101,6 +101,10 @@ IMPORTANT RULES:
   NEVER pre-calculate net price. NEVER put a calculated value in GrossPrice.
 - "Quantity": number of units ordered
 - "Einheit": pricing unit factor column (e.g. 1, 10, 100). If a row price is per 100 pieces, set Einheit=100.
+- "LineTotal": the line's total/extended price EXACTLY as printed on the PDF for that row
+  (look for a column named "Gesamtpreis", "Betrag", "Total", "Summe", or similar). This is
+  usually the last number in the row, separate from the per-unit "Einzelpreis"/"GrossPrice".
+  Set to null only if genuinely no total is printed for that line.
 - "Description": the FULL product description text exactly as it appears — including dimensions, sizes,
   material codes, and any suffix (e.g. "CITERDIAL 38 L 13,30" not just "CITERDIAL 38").
   Copy every word and number of the description line verbatim.
@@ -135,6 +139,7 @@ Replace ALL placeholder comments with real extracted values from the PDF text.
       "Quantity": 0.0,
       "Einheit": 1,
       "GrossPrice": 0.0,
+      "LineTotal": null,
       "DiscountPercent": null,
       "Description": null,
       "DescriptionUnit": null,
@@ -147,6 +152,9 @@ Replace ALL placeholder comments with real extracted values from the PDF text.
 IMPORTANT for VoucherLines:
 - "GrossPrice" = the list/gross price printed on the PDF. Do NOT calculate or modify it.
 - "Einheit" = pricing unit factor from the table column "Einheit" (or equivalent). Common values: 1, 10, 100.
+- "LineTotal" = the printed row total (e.g. "Gesamtpreis", "Betrag", "Total", "Summe" column).
+  This is the extended/line total, NOT the per-unit price. Extract it whenever a total is
+  printed per row -- it is used to sanity-check the unit price and Einheit downstream.
 - "DiscountPercent" = the discount % printed on the PDF (e.g. 33 or 35). Null if not shown.
 - "Description" = the COMPLETE description text, word for word, including all dimensions and codes.
 - "DescriptionUnit" = unit of measure abbreviation (e.g. "M", "ST", "KG"). Null if not shown.

@@ -255,6 +255,81 @@ def _unit_factor(pdf_line: dict) -> float:
     return 1.0
 
 
+def _printed_line_total(pdf_line: dict) -> float:
+    """
+    Returns the line total as printed on the PDF (Betrag/Total/Amount), or 0.0
+    if none was extracted for this line.
+    """
+    raw = (
+        pdf_line.get("LineTotal")
+        or pdf_line.get("Total")
+        or pdf_line.get("Amount")
+        or pdf_line.get("LineAmount")
+    )
+    return _as_float(raw, default=0.0)
+
+
+def _resolve_unit_price_and_factor(pdf_line: dict, base_unit_price: float) -> tuple[float, float, str]:
+    """
+    Decide the correct unit price to send to the ERP, without trusting the
+    extracted 'Einheit' value in isolation.
+
+    Different suppliers use the 'Einheit' column for different things:
+      - a genuine pricing factor (price is quoted per N pieces), where
+        dividing base_unit_price by Einheit is correct, or
+      - something else entirely (e.g. a repeated quantity, a pack-size
+        descriptor unrelated to pricing) where dividing is WRONG and produces
+        a unit price that is off by exactly that factor.
+
+    Rather than guessing which case applies from the column label alone, we
+    use the printed line total (Betrag) as ground truth: whichever
+    interpretation (divided vs. not-divided) reproduces Menge x Preis ~= Betrag
+    is the one we trust. This makes the check format-agnostic since the
+    Menge x Preis = Betrag identity holds across supplier layouts, even when
+    the meaning of 'Einheit' does not.
+
+    Returns: (chosen_unit_price, effective_factor_used, resolution_reason)
+    """
+    unit_factor = _unit_factor(pdf_line)
+    quantity = _as_float(pdf_line.get("Quantity", 0), default=0.0)
+    line_total = _printed_line_total(pdf_line)
+
+    candidate_divided = round(base_unit_price / unit_factor, 3) if unit_factor else round(base_unit_price, 3)
+    candidate_plain = round(base_unit_price, 3)
+
+    # No factor extracted (or factor is 1) -> nothing to reconcile.
+    if unit_factor == 1.0:
+        return candidate_plain, 1.0, "einheit_is_one"
+
+    # Fast-path heuristic: Einheit exactly matches Quantity is a strong signal
+    # that the column held a repeated/derived quantity, not a pricing factor
+    # (this is the pattern seen with Festo AG confirmations).
+    factor_equals_quantity = quantity > 0 and unit_factor == quantity
+
+    if quantity > 0 and line_total > 0:
+        error_divided = abs(candidate_divided * quantity - line_total)
+        error_plain = abs(candidate_plain * quantity - line_total)
+        # Small absolute tolerance for rounding noise in printed totals.
+        tolerance = max(0.02, line_total * 0.01)
+
+        if error_divided <= tolerance and error_divided <= error_plain:
+            return candidate_divided, unit_factor, "confirmed_by_line_total"
+        if error_plain <= tolerance and error_plain < error_divided:
+            return candidate_plain, 1.0, "rejected_by_line_total"
+        # Neither reproduces the printed total cleanly -> can't confirm either
+        # way from arithmetic alone. Fall back to the quantity heuristic if it
+        # applies, otherwise keep the extractor's literal answer but mark it
+        # for review.
+        if factor_equals_quantity:
+            return candidate_plain, 1.0, "ambiguous_defaulted_by_quantity_match"
+        return candidate_divided, unit_factor, "ambiguous_no_line_total_match"
+
+    # No printed line total available to check against.
+    if factor_equals_quantity:
+        return candidate_plain, 1.0, "no_line_total_defaulted_by_quantity_match"
+    return candidate_divided, unit_factor, "no_line_total_unverified"
+
+
 def _normalize_article(value: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", (value or "").upper())
 
@@ -401,6 +476,7 @@ def push_to_erp(extracted: dict) -> dict:
     updated_ids: list[str] = []
     updated_pdf_numbers: list[str] = []
     unit_factor_alert_lines: list[dict] = []
+    unit_factor_corrected_lines: list[dict] = []
     long_delivery_alert_lines: list[dict] = []
     surcharge_alert_lines: list[dict] = []
     quantity_mismatch_alert_lines: list[dict] = []
@@ -450,8 +526,9 @@ def push_to_erp(extracted: dict) -> dict:
                     }
                 )
         base_unit_price = _effective_unit_price(pdf_line)
-        unit_factor = _unit_factor(pdf_line)
-        unit_price = round(base_unit_price / unit_factor, 3)
+        unit_price, unit_factor, unit_price_resolution = _resolve_unit_price_and_factor(
+            pdf_line, base_unit_price
+        )
         erp_quantity = _as_float(matched.get("Quantity", 0), default=0.0)
         extracted_quantity = _as_float(pdf_line.get("Quantity", 0), default=0.0)
         qty_for_total = erp_quantity if erp_quantity > 0 else extracted_quantity
@@ -479,13 +556,36 @@ def push_to_erp(extracted: dict) -> dict:
                     "erp_quantity": erp_quantity,
                 }
             )
-        if unit_factor != 1.0:
+        if unit_price_resolution == "rejected_by_line_total":
+            # Einheit was extracted as non-1, but dividing by it did NOT
+            # reproduce the printed line total, while treating it as 1 did.
+            # We auto-corrected; log it so the pattern can be tracked, but
+            # this does not require manual review since the total confirms it.
+            unit_factor_corrected_lines.append(
+                {
+                    "article_number": str(pdf_line.get("Number", "")).strip(),
+                    "extracted_einheit": _unit_factor(pdf_line),
+                    "base_unit_price": round(base_unit_price, 4),
+                    "corrected_unit_price": round(unit_price, 4),
+                    "reason": unit_price_resolution,
+                }
+            )
+        elif unit_price_resolution in (
+            "ambiguous_no_line_total_match",
+            "ambiguous_defaulted_by_quantity_match",
+            "no_line_total_unverified",
+            "no_line_total_defaulted_by_quantity_match",
+        ):
+            # Either the printed total didn't clearly confirm either
+            # interpretation, or there was no total to check against at all.
+            # These genuinely need a human to double-check.
             unit_factor_alert_lines.append(
                 {
                     "article_number": str(pdf_line.get("Number", "")).strip(),
                     "factor": unit_factor,
                     "base_unit_price": round(base_unit_price, 4),
                     "erp_unit_price": round(unit_price, 4),
+                    "reason": unit_price_resolution,
                 }
             )
 
@@ -525,8 +625,16 @@ def push_to_erp(extracted: dict) -> dict:
         alerts.append(
             {
                 "type": "unit_factor",
-                "message": "Double-check required: Einheit/unit-factor pricing detected.",
+                "message": "Double-check required: Einheit/unit-factor pricing could not be confirmed against the printed line total.",
                 "lines": unit_factor_alert_lines,
+            }
+        )
+    if unit_factor_corrected_lines:
+        alerts.append(
+            {
+                "type": "unit_factor_auto_corrected",
+                "message": "Info only: extracted Einheit value did not match the printed line total and was ignored; price used as printed.",
+                "lines": unit_factor_corrected_lines,
             }
         )
     if long_delivery_alert_lines:
@@ -546,7 +654,7 @@ def push_to_erp(extracted: dict) -> dict:
             }
         )
     if quantity_mismatch_alert_lines:
-        alerts.append(
+        alerts.append( 
             {
                 "type": "quantity_mismatch",
                 "message": "Double-check required: PDF quantity differs from ERP order quantity. ERP quantity used for totals.",
