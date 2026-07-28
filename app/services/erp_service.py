@@ -461,16 +461,16 @@ def push_to_erp(extracted: dict) -> dict:
     """
     our_order_number = str(extracted.get("OurOrderNumber", "")).strip()
     if not our_order_number:
-        raise ValueError("OurOrderNumber could not be extracted from the PDF.")
+        raise ValueError("OurOrderNumber konnte nicht aus dem PDF extrahiert werden.")
 
     voucher_number_b = _build_po_voucher_number(our_order_number)
     erp_lines = _get_purchase_order_lines(voucher_number_b)
     if not erp_lines:
-        raise ValueError(f"No ERP lines found for purchase order '{voucher_number_b}'.")
+        raise ValueError(f"Keine ERP-Zeilen für den Auftrag '{voucher_number_b}' gefunden.")
 
     source_lines = extracted.get("VoucherLines", []) or []
     if not source_lines:
-        raise ValueError("No voucher lines extracted from PDF; nothing to update in ERP.")
+        raise ValueError("Keine Belegzeilen aus dem PDF extrahiert; nichts im ERP zu aktualisieren.")
 
     used_ids: set[int] = set()
     updated_ids: list[str] = []
@@ -610,8 +610,8 @@ def push_to_erp(extracted: dict) -> dict:
 
     if updated_count == 0:
         raise ValueError(
-            f"No ERP lines were updated for purchase order '{voucher_number_b}'. "
-            "Check article-number mapping between PDF and ERP voucher lines."
+            f"Für den Auftrag '{voucher_number_b}' wurden keine ERP-Zeilen aktualisiert. "
+            "Bitte die Artikelnummer-Zuordnung zwischen PDF und ERP-Belegzeilen prüfen."
         )
 
     # Keep existing response structure for frontend:
@@ -625,7 +625,7 @@ def push_to_erp(extracted: dict) -> dict:
         alerts.append(
             {
                 "type": "unit_factor",
-                "message": "Double-check required: Einheit/unit-factor pricing could not be confirmed against the printed line total.",
+                "message": "Prüfung erforderlich: Einheit/Preisfaktor konnte anhand des gedruckten Zeilen-Gesamtbetrags nicht bestätigt werden.",
                 "lines": unit_factor_alert_lines,
             }
         )
@@ -633,7 +633,7 @@ def push_to_erp(extracted: dict) -> dict:
         alerts.append(
             {
                 "type": "unit_factor_auto_corrected",
-                "message": "Info only: extracted Einheit value did not match the printed line total and was ignored; price used as printed.",
+                "message": "Nur zur Info: Der extrahierte Einheit-Wert stimmte nicht mit dem gedruckten Zeilen-Gesamtbetrag überein und wurde ignoriert; es wurde der gedruckte Preis verwendet.",
                 "lines": unit_factor_corrected_lines,
             }
         )
@@ -641,7 +641,7 @@ def push_to_erp(extracted: dict) -> dict:
         alerts.append(
             {
                 "type": "delivery_date_gt_one_week",
-                "message": "Double-check required: Delivery date is more than one week after order date.",
+                "message": "Prüfung erforderlich: Das Lieferdatum liegt mehr als eine Woche nach dem Bestelldatum.",
                 "lines": long_delivery_alert_lines,
             }
         )
@@ -649,7 +649,7 @@ def push_to_erp(extracted: dict) -> dict:
         alerts.append(
             {
                 "type": "surcharge_added",
-                "message": "Double-check required: extra charge added (e.g. 5.5%).",
+                "message": "Prüfung erforderlich: Zusätzlicher Aufschlag hinzugefügt (z. B. 5,5 %).",
                 "lines": surcharge_alert_lines,
             }
         )
@@ -657,7 +657,7 @@ def push_to_erp(extracted: dict) -> dict:
         alerts.append( 
             {
                 "type": "quantity_mismatch",
-                "message": "Double-check required: PDF quantity differs from ERP order quantity. ERP quantity used for totals.",
+                "message": "Prüfung erforderlich: Die Menge im PDF weicht von der ERP-Bestellmenge ab. Für die Summen wurde die ERP-Menge verwendet.",
                 "lines": quantity_mismatch_alert_lines,
             }
         )
@@ -668,11 +668,11 @@ def push_to_erp(extracted: dict) -> dict:
         diff = round(pdf_total_num - calculated_total, 2)
         if abs(diff) >= 0.05:
             pct = round((diff / calculated_total) * 100.0, 2) if calculated_total > 0 else None
-            msg = "Double-check required: PDF total differs from updated line total."
+            msg = "Prüfung erforderlich: Der PDF-Gesamtbetrag weicht vom aktualisierten Zeilen-Gesamtbetrag ab."
             if pct is not None and abs(pct - 5.5) <= 0.25:
                 msg = (
-                    "Double-check required: extra charge added (approx. 5.5%), "
-                    "still double-check it."
+                    "Prüfung erforderlich: Zusätzlicher Aufschlag hinzugefügt (ca. 5,5 %), "
+                    "trotzdem bitte prüfen."
                 )
             alerts.append(
                 {

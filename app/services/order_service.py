@@ -157,7 +157,7 @@ def _run_pipeline(
         # Step 1 - extract text
         pdf_text = extract_text_from_bytes(pdf_bytes)
         if not pdf_text.strip():
-            raise ValueError("No text could be extracted (image-based PDF?)")
+            raise ValueError("Es konnte kein Text extrahiert werden (bildbasiertes PDF?)")
         logger.info("Text extracted for file_name=%s, chars=%d", file_name, len(pdf_text))
 
         # Step 2 - LLM extraction
