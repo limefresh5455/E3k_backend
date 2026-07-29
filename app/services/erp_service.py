@@ -527,25 +527,10 @@ def push_to_erp(extracted: dict) -> dict:
         alerts.append(
             {
                 "type": "unit_factor",
-<<<<<<< HEAD
                 "message": "Double-check required: Einheit/unit-factor pricing detected.",
                 "lines": unit_factor_alert_lines,
             }
         )
-=======
-                "message": "Prüfung erforderlich: Einheit/Preisfaktor konnte anhand des gedruckten Zeilen-Gesamtbetrags nicht bestätigt werden.",
-                "lines": unit_factor_alert_lines,
-            }
-        )
-    if unit_factor_corrected_lines:
-        alerts.append(
-            {
-                "type": "unit_factor_auto_corrected",
-                "message": "Nur zur Info: Der extrahierte Einheit-Wert stimmte nicht mit dem gedruckten Zeilen-Gesamtbetrag überein und wurde ignoriert; es wurde der gedruckte Preis verwendet.",
-                "lines": unit_factor_corrected_lines,
-            }
-        )
->>>>>>> 039e881 (Translate ERP and order service user-facing messages to German)
     if long_delivery_alert_lines:
         alerts.append(
             {
