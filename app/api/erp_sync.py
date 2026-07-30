@@ -13,7 +13,7 @@ def trigger_erp_sync():
         raise HTTPException(
             status_code=409,
             detail={
-                "message": "Sync already running.",
+                "message": "Synchronisierung läuft bereits.",
                 "started_at": result.get("started_at"),
             },
         )
@@ -21,9 +21,9 @@ def trigger_erp_sync():
     return JSONResponse(
         status_code=202,
         content={
-            "message": "Sync started in background.",
+            "message": "Synchronisierung im Hintergrund gestartet.",
             "started_at": result["started_at"],
-            "note": "Poll /sync/status to monitor progress.",
+            "note": "Fortschritt über /sync/status abfragen.",
         },
     )
 

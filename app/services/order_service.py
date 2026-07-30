@@ -407,7 +407,7 @@ def update_order_line_after_manual_correction(
     if not row:
         cur.close()
         conn.close()
-        raise ValueError(f"Order id {order_id} not found.")
+        raise ValueError(f"Auftrag mit der ID {order_id} wurde nicht gefunden.")
 
     order = dict(row)
     extracted = order.get("extracted_json") or {}
@@ -424,8 +424,8 @@ def update_order_line_after_manual_correction(
         cur.close()
         conn.close()
         raise ValueError(
-            f"No line with erp_article_no='{erp_article_no}' found on order id {order_id}. "
-            "The ERP was still updated; only the dashboard record could not be synced."
+            f"Im Auftrag mit der ID {order_id} wurde keine Zeile mit erp_article_no='{erp_article_no}' gefunden. "
+            "Das ERP wurde trotzdem aktualisiert; nur der Dashboard-Datensatz konnte nicht synchronisiert werden."
         )
 
     matched_line["GrossPrice"] = unit_price

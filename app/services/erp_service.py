@@ -479,18 +479,19 @@ def push_manual_line_update(
     """
     voucher_number_b = _build_po_voucher_number(voucher_number)
     if not voucher_number_b:
-        raise ValueError("voucher_number is required.")
+        raise ValueError("voucher_number ist erforderlich.")
 
     article_number = str(article_number or "").strip()
     if not article_number:
-        raise ValueError("article_number is required.")
+        raise ValueError("article_number ist erforderlich.")
 
     formatted_delivery_date = None
     if delivery_date:
         parsed_date = _parse_date_flexible(str(delivery_date))
         if not parsed_date:
             raise ValueError(
-                f"Could not parse delivery_date '{delivery_date}'. Use DD.MM.YYYY or YYYY-MM-DD."
+                f"delivery_date '{delivery_date}' konnte nicht gelesen werden. "
+                "Bitte DD.MM.YYYY oder YYYY-MM-DD verwenden."
             )
         formatted_delivery_date = parsed_date.strftime("%Y-%m-%d 00:00:00.000")
 
@@ -752,8 +753,8 @@ def push_to_erp(extracted: dict) -> dict:
             {
                 "type": "lines_recovered_via_fallback",
                 "message": (
-                    "Double-check required: initial extraction missed line(s) that a fallback "
-                    "text-table parser had to recover."
+                    "Prüfung erforderlich: Die erste Extraktion hat Zeile(n) übersehen, "
+                    "die von einem Fallback-Textparser wiederhergestellt werden mussten."
                 ),
                 "lines": [{"recovered_line_count": recovered_line_count}],
             }
@@ -764,8 +765,8 @@ def push_to_erp(extracted: dict) -> dict:
             {
                 "type": "fewer_lines_than_expected",
                 "message": (
-                    "Double-check required: fewer PDF lines were matched/updated than the "
-                    "ERP purchase order actually has - some rows may be missing."
+                    "Prüfung erforderlich: Es wurden weniger PDF-Zeilen abgeglichen/aktualisiert, "
+                    "als die ERP-Bestellung tatsächlich enthält - möglicherweise fehlen einige Zeilen."
                 ),
                 "lines": [
                     {
