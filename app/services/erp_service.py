@@ -354,7 +354,75 @@ def _get_purchase_order_lines(voucher_number_b: str) -> list[dict]:
     return body
 
 
-def _pick_best_erp_line(pdf_line: dict, erp_lines: list[dict], used_ids: set[int]) -> Optional[dict]:
+def _lookup_supplier_article_f028(supplier_no: str, article_no: str) -> Optional[str]:
+    """
+    Call ERP POST /api/SupplierArticle/Custom to resolve the supplier's own
+    article number (F028) for a given internal SupplierNumber + ArticleNumber
+    combination.
+
+    Request body shape (per ERP docs):
+        {
+            "Fields": ["F028"],
+            "Filters": [
+                {"FieldNumber": 1, "Value": <supplier_no>, "Combine": 1, "Type": 1},
+                {"FieldNumber": 2, "Value": <article_no>,  "Combine": 1, "Type": 1}
+            ]
+        }
+
+    Response shape:
+        [ { "F028": "3600020L1DA05Z                                    " } ]
+
+    Returns the normalized (regex-cleaned) F028 value, or None if the ERP
+    call fails, returns no rows, or the row has no usable F028 value.
+    Wrapped so any error is swallowed and behaves like "no match" — this is
+    a best-effort fallback and must never break the existing matching flow.
+    """
+    try:
+        url = f"{ERP_BASE_URL}/api/SupplierArticle/Custom"
+        payload = {
+            "Fields": ["F028"],
+            "Filters": [
+                {"FieldNumber": 1, "Value": supplier_no, "Combine": 1, "Type": 1},
+                {"FieldNumber": 2, "Value": article_no, "Combine": 1, "Type": 1},
+            ],
+        }
+        response = _erp_request(
+            "POST",
+            url,
+            context="SupplierArticle/Custom",
+            json=payload,
+            auth=_auth(),
+        )
+        if not response.ok:
+            logger.warning(
+                "SupplierArticle/Custom lookup failed (%s) for supplier_no=%s, article_no=%s: %s",
+                response.status_code, supplier_no, article_no, response.text[:500],
+            )
+            return None
+
+        body = response.json()
+        if not isinstance(body, list) or not body:
+            return None
+
+        raw_f028 = str(body[0].get("F028", "")).strip()
+        if not raw_f028:
+            return None
+
+        return _normalize_article(raw_f028)
+    except Exception as exc:
+        logger.warning(
+            "SupplierArticle/Custom lookup raised for supplier_no=%s, article_no=%s: %s",
+            supplier_no, article_no, exc,
+        )
+        return None
+
+
+def _pick_best_erp_line(
+    pdf_line: dict,
+    erp_lines: list[dict],
+    used_ids: set[int],
+    supplier_no: str,
+) -> Optional[dict]:
     pdf_number = str(pdf_line.get("Number", "")).strip()
     pdf_norm = _normalize_article(pdf_number)
     pdf_desc = str(pdf_line.get("Description", "")).strip().lower()
@@ -406,7 +474,52 @@ def _pick_best_erp_line(pdf_line: dict, erp_lines: list[dict], used_ids: set[int
             candidates.append((score, line))
 
     if not candidates:
+        # ── Fallback: ERP SupplierArticle/Custom (F028) lookup ──
+        # No normal-score candidate was found above. As a last resort, ask
+        # the ERP directly (via SupplierArticle/Custom) for the supplier's
+        # own article number (F028) for each candidate ERP line's
+        # SupplierNumber + ArticleNumber, and compare that against the
+        # article number printed on the PDF. This covers cases where the
+        # supplier's article number is stored separately in the ERP's
+        # SupplierArticle table (F028 field) rather than being derivable
+        # from a simple string combination.
+        # Wrapped in try/except so any error here behaves like "no match"
+        # and never breaks the existing matching flow above.
+        try:
+            for line in erp_lines:
+                line_id = line.get("Id")
+                if line_id in used_ids:
+                    continue
+
+                line_flag = int(line.get("LineFlag", 0) or 0)
+                if line_flag != 1:
+                    continue
+
+                article = str(line.get("ArticleNumber", "")).strip()
+                if not article:
+                    continue
+
+                if not supplier_no:
+                    continue
+
+                f028_norm = _lookup_supplier_article_f028(supplier_no, article)
+                if not f028_norm:
+                    continue
+
+                if pdf_norm and f028_norm == pdf_norm:
+                    logger.info(
+                        "Fallback SupplierArticle/Custom (F028) match found: "
+                        "pdf_number=%s, supplier_no=%s, erp_article=%s, f028=%s, erp_id=%s",
+                        pdf_number, supplier_no, article, f028_norm, line_id,
+                    )
+                    return line
+        except Exception as exc:
+            logger.warning(
+                "Fallback SupplierArticle/Custom (F028) match check failed for pdf_number=%s: %s",
+                pdf_number, exc,
+            )
         return None
+
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0][1]
 
@@ -544,6 +657,11 @@ def push_to_erp(extracted: dict) -> dict:
     if not erp_lines:
         raise ValueError(f"Keine ERP-Zeilen für den Auftrag '{voucher_number_b}' gefunden.")
 
+    # SupplierArticle records are keyed by the supplier number stored on the
+    # purchase-order address/header. Voucher lines do not necessarily repeat
+    # that value themselves.
+    supplier_no = str(erp_lines[0].get("VoucherAddress") or "").strip()
+
     expected_line_count = sum(
         1
         for line in erp_lines
@@ -574,7 +692,7 @@ def push_to_erp(extracted: dict) -> dict:
         order_date_dt = _parse_date_flexible(order_date_raw)
 
     for pdf_line in source_lines:
-        matched = _pick_best_erp_line(pdf_line, erp_lines, used_ids)
+        matched = _pick_best_erp_line(pdf_line, erp_lines, used_ids, supplier_no)
         if not matched:
             logger.warning(
                 "No ERP voucher line match found for extracted line number=%s description=%s",
@@ -782,8 +900,12 @@ def push_to_erp(extracted: dict) -> dict:
     pdf_total_num = _as_float(pdf_total, default=0.0) if pdf_total is not None else 0.0
     if pdf_total_num > 0:
         diff = round(pdf_total_num - calculated_total, 2)
-        if abs(diff) >= 0.05:
-            pct = round((diff / calculated_total) * 100.0, 2) if calculated_total > 0 else None
+        pct = round((diff / calculated_total) * 100.0, 2) if calculated_total > 0 else None
+        # Deviations within 10% of the calculated line total are treated as acceptable
+        # and are not flagged. Anything at/above 10% (or where a percentage can't be
+        # computed, e.g. calculated_total == 0) still requires review.
+        within_tolerance = pct is not None and abs(pct) < 10.0
+        if abs(diff) >= 0.05 and not within_tolerance:
             msg = "Prüfung erforderlich: Der PDF-Gesamtbetrag weicht vom aktualisierten Zeilen-Gesamtbetrag ab."
             if pct is not None and abs(pct - 5.5) <= 0.25:
                 msg = (

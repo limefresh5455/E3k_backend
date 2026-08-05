@@ -16,6 +16,8 @@ def trigger_erp_sync():
                 "message": "Synchronisierung läuft bereits.",
                 "started_at": result.get("started_at"),
             },
+
+            
         )
 
     return JSONResponse(
