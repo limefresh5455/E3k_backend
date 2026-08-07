@@ -4,13 +4,14 @@ import logging
 import random
 import re
 import time
+import unicodedata
 from datetime import datetime, timedelta
 
 import fitz  # PyMuPDF
 import pdfplumber
 import pytesseract
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI, RateLimitError
-from PIL import Image
+from PIL import Image, ImageOps
 
 from app.config import OPENAI_API_KEY, TESSERACT_CMD
 
@@ -36,6 +37,91 @@ _RECIPIENT_BLOCKLIST = {
     "schlauch-service baumann gmbh",
     "schlauch service baumann gmbh",
 }
+
+_BLOCKED_LOGO_BRAND = "SCHLAUCHSERVICE"
+_BLOCKED_LOGO_TAGLINE = "EINEVERBINDUNGDIEHALT"
+_BLOCKED_LOGO_DHASH = int(
+    "000002420080b3e3bb729a6695629573c000c002c900c0008d108d4891349000",
+    16,
+)
+_BLOCKED_LOGO_DHASH_MAX_DISTANCE = 12
+
+
+def _normalize_logo_ocr_text(text: str) -> str:
+    """Normalize OCR output without making the blocked-logo rule fuzzy."""
+    ascii_text = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^A-Z0-9]", "", ascii_text.upper())
+
+
+def _is_blocked_logo_ocr(text: str) -> bool:
+    """Match both pieces of the specific SCHLAUCHSERVICE logo in one image."""
+    normalized = _normalize_logo_ocr_text(text)
+    return _BLOCKED_LOGO_BRAND in normalized and _BLOCKED_LOGO_TAGLINE in normalized
+
+
+def _image_dhash(image: Image.Image, size: int = 16) -> int:
+    grayscale = image.convert("L").resize((size + 1, size), Image.Resampling.LANCZOS)
+    result = 0
+    for y in range(size):
+        for x in range(size):
+            result = (result << 1) | (
+                grayscale.getpixel((x, y)) > grayscale.getpixel((x + 1, y))
+            )
+    return result
+
+
+def _is_blocked_logo_visual(image: Image.Image) -> bool:
+    """Strictly match the supplied red/black logo, allowing only resize/compression noise."""
+    if image.height <= 0:
+        return False
+    aspect_ratio = image.width / image.height
+    if not 3.5 <= aspect_ratio <= 5.0:
+        return False
+
+    sample = image.convert("RGB").resize((241, 56), Image.Resampling.LANCZOS)
+    red_pixels = 0
+    dark_pixels = 0
+    pixel_count = sample.width * sample.height
+    pixels = sample.load()
+    for y in range(sample.height):
+        for x in range(sample.width):
+            r, g, b = pixels[x, y]
+            if r >= 140 and r >= g * 1.5 and r >= b * 1.5:
+                red_pixels += 1
+            if max(r, g, b) <= 100:
+                dark_pixels += 1
+
+    red_ratio = red_pixels / pixel_count
+    dark_ratio = dark_pixels / pixel_count
+    if not (0.01 <= red_ratio <= 0.08 and 0.04 <= dark_ratio <= 0.25):
+        return False
+
+    distance = (_image_dhash(image) ^ _BLOCKED_LOGO_DHASH).bit_count()
+    return distance <= _BLOCKED_LOGO_DHASH_MAX_DISTANCE
+
+
+def _tesseract_image_text(image: Image.Image, *, page_segmentation_mode=None) -> str:
+    config = f"--psm {page_segmentation_mode}" if page_segmentation_mode is not None else ""
+    try:
+        return pytesseract.image_to_string(image, lang="deu+eng", config=config).strip()
+    except pytesseract.TesseractError:
+        return pytesseract.image_to_string(image, lang="eng", config=config).strip()
+
+
+def _blocked_logo_visible_in_image(image: Image.Image, initial_ocr_text: str) -> bool:
+    if _is_blocked_logo_visual(image) or _is_blocked_logo_ocr(initial_ocr_text):
+        return True
+
+    # Logo taglines are often too small for the default OCR pass. Upscaling and
+    # autocontrast improve recognition while the strict two-text rule still
+    # prevents an ordinary company-name occurrence from causing a skip.
+    grayscale = ImageOps.autocontrast(image.convert("L"))
+    enlarged = grayscale.resize(
+        (max(grayscale.width * 3, 900), max(grayscale.height * 3, 300)),
+        Image.Resampling.LANCZOS,
+    )
+    logo_ocr_text = _tesseract_image_text(enlarged, page_segmentation_mode=6)
+    return _is_blocked_logo_ocr(logo_ocr_text)
 
 _COMPANY_SUFFIX_PATTERN = r"(?:AG|GMBH|SARL|SAS|SA|SRL|KG|OHG|LIMITED|LTD|INC|BV|NV)\b"
 _GENERIC_NON_SUPPLIER_WORDS = {
@@ -300,7 +386,7 @@ def _fallback_supplier_from_text(pdf_text: str) -> str | None:
     return None
 
 
-def _ocr_images_from_bytes(pdf_bytes: bytes) -> str:
+def _ocr_images_from_bytes(pdf_bytes: bytes) -> tuple[str, bool]:
     """
     OCR every raster image embedded in the PDF (logos, footer bars, etc.).
 
@@ -309,12 +395,15 @@ def _ocr_images_from_bytes(pdf_bytes: bytes) -> str:
     each embedded image recovers that text so the LLM can identify the supplier.
 
     Images smaller than 100 × 30 px are skipped (decorative icons / dividers).
-    Returns the concatenated OCR output, or an empty string if nothing is found.
+    Returns the concatenated OCR output and whether the exact blocked logo was
+    recognized. Detection is deliberately limited to text from the same
+    embedded image; ordinary/selectable PDF text cannot trigger it.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     ocr_parts: list[str] = []
     processed_images = 0
     images_with_text = 0
+    blocked_logo_found = False
 
     try:
         for page in doc:
@@ -331,14 +420,14 @@ def _ocr_images_from_bytes(pdf_bytes: bytes) -> str:
                     # Convert via encoded PNG bytes. This is more robust than raw
                     # Image.frombytes for unusual embedded image pixel formats.
                     img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-                    try:
-                        text = pytesseract.image_to_string(img, lang="deu+eng").strip()
-                    except pytesseract.TesseractError:
-                        # Fallback for hosts where German language pack is not installed.
-                        text = pytesseract.image_to_string(img, lang="eng").strip()
+                    if _is_blocked_logo_visual(img):
+                        blocked_logo_found = True
+                    text = _tesseract_image_text(img)
                     if text:
                         ocr_parts.append(text)
                         images_with_text += 1
+                    if _blocked_logo_visible_in_image(img, text):
+                        blocked_logo_found = True
                 except Exception:
                     # Ignore malformed embedded images and continue processing the PDF.
                     continue
@@ -346,11 +435,12 @@ def _ocr_images_from_bytes(pdf_bytes: bytes) -> str:
         doc.close()
 
     logger.info(
-        "OCR embedded images completed: processed=%d, with_text=%d",
+        "OCR embedded images completed: processed=%d, with_text=%d, blocked_logo=%s",
         processed_images,
         images_with_text,
+        blocked_logo_found,
     )
-    return "\n".join(ocr_parts)
+    return "\n".join(ocr_parts), blocked_logo_found
 
 
 def _ocr_full_pages_from_bytes(pdf_bytes: bytes) -> str:
@@ -370,10 +460,7 @@ def _ocr_full_pages_from_bytes(pdf_bytes: bytes) -> str:
             # Render at 2x for better OCR accuracy.
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
             img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-            try:
-                text = pytesseract.image_to_string(img, lang="deu+eng").strip()
-            except pytesseract.TesseractError:
-                text = pytesseract.image_to_string(img, lang="eng").strip()
+            text = _tesseract_image_text(img)
             if text:
                 page_texts.append(text)
                 pages_with_text += 1
@@ -388,7 +475,7 @@ def _ocr_full_pages_from_bytes(pdf_bytes: bytes) -> str:
     return "\n".join(page_texts)
 
 
-def extract_text_from_bytes(pdf_bytes: bytes) -> str:
+def extract_text_from_bytes(pdf_bytes: bytes, *, include_logo_detection: bool = False):
     """
     Extract all text from a PDF:
       1. Selectable text via pdfplumber (fast, accurate for text-based PDFs).
@@ -407,7 +494,7 @@ def extract_text_from_bytes(pdf_bytes: bytes) -> str:
                 text_parts.append(page_text)
 
     # --- Step 2: OCR on embedded images ---
-    ocr_text = _ocr_images_from_bytes(pdf_bytes)
+    ocr_text, blocked_logo_found = _ocr_images_from_bytes(pdf_bytes)
     if ocr_text:
         text_parts.append(f"\n=== IMAGE TEXT (OCR) ===\n{ocr_text}\n=== END IMAGE TEXT ===")
 
@@ -418,6 +505,8 @@ def extract_text_from_bytes(pdf_bytes: bytes) -> str:
         len(text_parts),
         bool(ocr_text),
     )
+    if include_logo_detection:
+        return final_text, blocked_logo_found
     return final_text
 
 
@@ -812,7 +901,10 @@ def build_summary(data: dict, file_name: str, folder_name: str) -> dict:
         discount = line.get("DiscountPercent")
         discount_pct = _as_float(discount, default=0.0) if discount is not None else None
         effective_price = unit_price if discount_pct is None else unit_price * (1 - (discount_pct / 100.0))
-        line_total = round(quantity * effective_price, 2)
+        line_total = round(
+            _as_float(line.get("LineTotal"), default=quantity * effective_price),
+            2,
+        )
         total += line_total
 
         summary_lines.append(
@@ -827,8 +919,21 @@ def build_summary(data: dict, file_name: str, folder_name: str) -> dict:
             }
         )
 
-    total_from_pdf = data.get("TotalNetFromPdf")
-    summary_total = round(_as_float(total_from_pdf, default=total), 2) if total_from_pdf is not None else round(total, 2)
+    # --- OLD LOGIC (commented out, kept for reference) ---
+    # total_from_pdf = data.get("TotalNetFromPdf")
+    # if total_from_pdf is not None:
+    #     pdf_total_num = _as_float(total_from_pdf, default=total)
+    #     if total > 0 and abs(pdf_total_num - total) / total * 100 >= 10:
+    #         # Extracted PDF total deviates too much (>=10%) from the calculated
+    #         # line total to be trusted here; fall back to the calculated total.
+    #         summary_total = round(total, 2)
+    #     else:
+    #         summary_total = round(pdf_total_num, 2)
+    # else:
+    #     summary_total = round(total, 2)
+
+    # New logic: always use the calculated line total (same value the modal shows)
+    summary_total = round(total, 2)
 
     return {
         "file_name": file_name,

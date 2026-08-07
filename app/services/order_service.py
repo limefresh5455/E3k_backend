@@ -142,6 +142,55 @@ def _save_failure(
     conn.close()
 
 
+def _save_skipped(
+    file_id: str,
+    file_name: str,
+    folder_name: str,
+    pdf_url: str,
+    reason: str,
+):
+    summary = {
+        "file_name": file_name,
+        "folder": folder_name,
+        "supplier": "SCHLAUCHSERVICE",
+        "line_count": 0,
+        "total_net": 0,
+        "lines": [],
+        "skip_reason": reason,
+    }
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO orders
+            (file_id, file_name, folder_name, pdf_url, supplier, status,
+             error_message, summary, attention, attention_reasons)
+        VALUES (%s, %s, %s, %s, 'SCHLAUCHSERVICE', 'skipped', %s, %s, FALSE, '[]'::jsonb)
+        ON CONFLICT (file_id) DO UPDATE SET
+            status='skipped',
+            file_name=EXCLUDED.file_name,
+            folder_name=EXCLUDED.folder_name,
+            pdf_url=EXCLUDED.pdf_url,
+            order_number=NULL,
+            supplier='SCHLAUCHSERVICE',
+            error_message=EXCLUDED.error_message,
+            extracted_json=NULL,
+            summary=EXCLUDED.summary,
+            erp_record_id=NULL,
+            erp_voucher_number=NULL,
+            erp_supplier_number=NULL,
+            erp_article_no=NULL,
+            attention=FALSE,
+            attention_reasons='[]'::jsonb,
+            processed_at=NOW()
+        """,
+        (file_id, file_name, folder_name, pdf_url, reason, json.dumps(summary)),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Shared pipeline core
 # ---------------------------------------------------------------------------
@@ -170,7 +219,26 @@ def _run_pipeline(
             pdf_url,
         )
         # Step 1 - extract text
-        pdf_text = extract_text_from_bytes(pdf_bytes)
+        pdf_text, blocked_logo_found = extract_text_from_bytes(
+            pdf_bytes,
+            include_logo_detection=True,
+        )
+        if blocked_logo_found:
+            reason = "SCHLAUCHSERVICE logo detected in embedded-image OCR"
+            logger.warning(
+                "Skipping PDF before LLM/ERP processing: file_id=%s, file_name=%s, reason=%s",
+                file_id,
+                file_name,
+                reason,
+            )
+            _save_skipped(file_id, file_name, folder_name, pdf_url, reason)
+            mark_as_processed(file_id, file_name)
+            return {
+                "status": "skipped",
+                "attention": False,
+                "attention_reasons": [],
+                "reason": reason,
+            }
         if not pdf_text.strip():
             raise ValueError("Es konnte kein Text extrahiert werden (bildbasiertes PDF?)")
         logger.info("Text extracted for file_name=%s, chars=%d", file_name, len(pdf_text))
@@ -471,6 +539,7 @@ def get_stats():
             COUNT(*) AS total,
             SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success,
             SUM(CASE WHEN status='attention' THEN 1 ELSE 0 END) AS attention,
+            SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) AS skipped,
             SUM(CASE WHEN status='failure' THEN 1 ELSE 0 END) AS failure,
             COUNT(DISTINCT supplier) AS suppliers
         FROM orders

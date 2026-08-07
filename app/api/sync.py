@@ -100,6 +100,8 @@ async def sync_pcloud():
             results["success"] += 1
         elif response["status"] == "attention":
             results["attention"] += 1
+        elif response["status"] == "skipped":
+            results["skipped"] += 1
         else:
             results["failure"] += 1
 
