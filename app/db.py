@@ -40,6 +40,9 @@ def init_db():
         ALTER TABLE orders ADD COLUMN IF NOT EXISTS erp_record_id TEXT;
         ALTER TABLE orders ADD COLUMN IF NOT EXISTS erp_voucher_number TEXT;
         ALTER TABLE orders ADD COLUMN IF NOT EXISTS erp_supplier_number TEXT;
+        ALTER TABLE orders ADD COLUMN IF NOT EXISTS erp_article_no TEXT;
+        ALTER TABLE orders ADD COLUMN IF NOT EXISTS attention BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE orders ADD COLUMN IF NOT EXISTS attention_reasons JSONB NOT NULL DEFAULT '[]'::jsonb;
         """
     )
     conn.commit()
