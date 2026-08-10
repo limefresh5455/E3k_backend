@@ -506,7 +506,28 @@ def _pick_best_erp_line(
                 if not f028_norm:
                     continue
 
-                if pdf_norm and f028_norm == pdf_norm:
+                logger.info(
+                    "F028 comparison: pdf_number=%s, pdf_norm=%s, supplier_no=%s, "
+                    "erp_article=%s, f028_norm=%s, erp_id=%s",
+                    pdf_number,
+                    pdf_norm,
+                    supplier_no,
+                    article,
+                    f028_norm,
+                    line_id,
+                )
+
+                is_match = (
+                    pdf_norm
+                    and f028_norm
+                    and (
+                        f028_norm == pdf_norm
+                        or f028_norm.startswith(pdf_norm)
+                        or pdf_norm.startswith(f028_norm)
+                    )
+                )
+
+                if is_match:
                     logger.info(
                         "Fallback SupplierArticle/Custom (F028) match found: "
                         "pdf_number=%s, supplier_no=%s, erp_article=%s, f028=%s, erp_id=%s",

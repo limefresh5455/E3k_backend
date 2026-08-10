@@ -177,6 +177,7 @@ IMPORTANT RULES:
 - All dates in the output must use the format DD.MM.YYYY (e.g. 18.03.2026). Convert ALL date formats to this.
 - "DeliveryDate": the confirmed delivery/dispatch date - look for "Lieferung/Termin", "Auslieferdatum", "Versandtermin", "Lieferung", "Termin best.", "Warenausgangsdatum", "Versand-Datum", "Liefertermin"
   * If the delivery date is given as a calendar week like "KW 11" or "KW11", convert it to the FRIDAY of that ISO week in the document year. Example: "KW 11" in year 2026 -> Friday of week 11, 2026 = 13.03.2026.
+  * A value in an "LT" column formatted as YYYY/WW is also an ISO calendar week. Convert it to the FRIDAY of that ISO week. Example: "LT 2026/32" -> 07.08.2026.
   * If no delivery date is mentioned at all, set DeliveryDate to null.
 - "VoucherDate": the document/order confirmation date - look for "Datum", "Belegdatum", date next to "Auftragsbestatigung". Format as DD.MM.YYYY.
 - For VoucherLines: extract ONLY real product/article lines. Skip shipping costs, surcharge lines, freight lines, and packaging lines UNLESS they have a real article number.
@@ -786,6 +787,68 @@ def _friday_of_week_from_date(date_text: str) -> str | None:
     return friday.strftime("%d.%m.%Y")
 
 
+def _friday_of_iso_week(year: int, week: int) -> str | None:
+    try:
+        friday = datetime.fromisocalendar(year, week, 5)
+    except ValueError:
+        return None
+    return friday.strftime("%d.%m.%Y")
+
+
+def _extract_line_delivery_weeks(pdf_text: str, extracted: dict) -> dict[str, list[str]]:
+    """Map each article occurrence to its Friday date from LT YYYY/WW rows."""
+    article_numbers = {
+        str(line.get("Number")).strip().upper()
+        for line in extracted.get("VoucherLines", [])
+        if line.get("Number")
+    }
+    delivery_dates: dict[str, list[str]] = {}
+
+    for raw_line in pdf_text.splitlines():
+        week_match = re.search(r"\b(20\d{2})/([0-5]?\d)\b", raw_line)
+        if not week_match:
+            continue
+
+        delivery_date = _friday_of_iso_week(
+            int(week_match.group(1)),
+            int(week_match.group(2)),
+        )
+        if not delivery_date:
+            continue
+
+        for article_number in article_numbers:
+            if re.search(
+                rf"(?<!\w){re.escape(article_number)}(?!\w)",
+                raw_line,
+                flags=re.IGNORECASE,
+            ):
+                delivery_dates.setdefault(article_number, []).append(delivery_date)
+                break
+
+    return delivery_dates
+
+
+def _apply_lt_delivery_weeks(pdf_text: str, extracted: dict) -> dict:
+    """Override LLM dates with deterministic dates from LT YYYY/WW rows."""
+    delivery_dates = _extract_line_delivery_weeks(pdf_text, extracted)
+    confirmed_dates: list[datetime] = []
+
+    for line in extracted.get("VoucherLines", []):
+        article_number = str(line.get("Number") or "").strip().upper()
+        article_dates = delivery_dates.get(article_number)
+        if not article_dates:
+            continue
+
+        delivery_date = article_dates.pop(0)
+        line["DeliveryDate"] = delivery_date
+        confirmed_dates.append(datetime.strptime(delivery_date, "%d.%m.%Y"))
+
+    if confirmed_dates:
+        extracted["DeliveryDate"] = min(confirmed_dates).strftime("%d.%m.%Y")
+
+    return extracted
+
+
 def _apply_delivery_date_fallbacks(pdf_text: str, extracted: dict) -> dict:
     voucher_date = extracted.get("VoucherDate")
     fallback = None
@@ -841,6 +904,7 @@ def extract_order_data(pdf_text: str, pdf_bytes: bytes) -> dict:
     )
     supplier_val = extracted.get("Supplier")
     extracted = _recover_missing_numbered_lines(pdf_text, extracted)
+    extracted = _apply_lt_delivery_weeks(pdf_text, extracted)
     extracted = _apply_delivery_date_fallbacks(pdf_text, extracted)
     total_pdf, curr_pdf = _extract_total_from_last_pdf_page(pdf_bytes)
     if total_pdf is None:
@@ -867,6 +931,7 @@ def extract_order_data(pdf_text: str, pdf_bytes: bytes) -> dict:
         logger.warning("Supplier still unresolved after full-page OCR fallback.")
 
     extracted = _recover_missing_numbered_lines(merged_text, extracted)
+    extracted = _apply_lt_delivery_weeks(merged_text, extracted)
     extracted = _apply_delivery_date_fallbacks(merged_text, extracted)
     return extracted
 
