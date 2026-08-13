@@ -892,6 +892,162 @@ def _preprocess_merged_positions(text: str) -> str:
     return pattern.sub(r"\1\2 \3", text)
 
 
+def _is_mcc_order_confirmation(pdf_text: str) -> bool:
+    """Recognize MCC's order-confirmation table without relying on supplier extraction."""
+    normalized = re.sub(r"\s+", " ", pdf_text or "").casefold()
+    signatures = (
+        "mcc millennium coupling",
+        "netto preis",
+        "gesamtpreis",
+        "preis/me",
+    )
+    return all(signature in normalized for signature in signatures)
+
+
+def _mcc_number(value: str) -> float | None:
+    match = re.search(r"-?\d+(?:[.,]\d+)?", value or "")
+    if not match:
+        return None
+    return _as_float(match.group(0), default=0.0)
+
+
+def _extract_mcc_table_rows(pdf_bytes: bytes) -> list[dict]:
+    """Read MCC table values from their physical PDF columns, page by page."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    rows: list[dict] = []
+    try:
+        for page in doc:
+            words = page.get_text("words")
+            position_words = [
+                word for word in words
+                if 45 <= word[0] <= 65 and re.fullmatch(r"\d{1,3}", word[4])
+            ]
+            position_words.sort(key=lambda word: word[1])
+
+            for index, position_word in enumerate(position_words):
+                row_y = position_word[1]
+                next_y = (
+                    position_words[index + 1][1]
+                    if index + 1 < len(position_words)
+                    else page.rect.height
+                )
+                baseline = [word for word in words if abs(word[1] - row_y) <= 1.5]
+
+                article_parts = [
+                    word[4] for word in baseline if 70 <= word[0] < 124
+                ]
+                quantity_parts = [
+                    word[4] for word in baseline if 325 <= word[0] < 385
+                ]
+                gross_parts = [
+                    word[4] for word in baseline if 385 <= word[0] < 425
+                ]
+                net_parts = [
+                    word[4] for word in baseline if 425 <= word[0] < 477
+                ]
+                total_parts = [
+                    word[4] for word in baseline if 477 <= word[0] < 545
+                ]
+                if not all((article_parts, quantity_parts, gross_parts, net_parts, total_parts)):
+                    continue
+
+                discount_words = [
+                    word for word in words
+                    if row_y < word[1] < next_y and 375 <= word[0] < 430
+                ]
+                discount_text = " ".join(word[4] for word in sorted(discount_words, key=lambda w: (w[1], w[0])))
+                discount_match = re.search(r"(\d+(?:[.,]\d+)?)\s*%", discount_text)
+                if not discount_match:
+                    continue
+
+                quantity_token = "".join(quantity_parts)
+                quantity = _mcc_number(quantity_token)
+                gross_price = _mcc_number("".join(gross_parts))
+                net_price = _mcc_number("".join(net_parts))
+                line_total = _mcc_number("".join(total_parts))
+                discount = _mcc_number(discount_match.group(1))
+                if None in (quantity, gross_price, net_price, line_total, discount):
+                    continue
+
+                # Accept a row only when both independent price relationships
+                # agree with the printed values. This prevents column-position
+                # assumptions from silently changing an unfamiliar layout.
+                expected_net = gross_price * (1 - (discount / 100.0))
+                expected_total = quantity * expected_net
+                if abs(net_price - expected_net) > 0.02:
+                    continue
+                if abs(line_total - expected_total) > 0.03:
+                    continue
+
+                unit_match = re.search(r"[A-Za-zÄÖÜäöü]+", quantity_token)
+                rows.append(
+                    {
+                        "number": "".join(article_parts),
+                        "quantity": quantity,
+                        "unit": unit_match.group(0) if unit_match else None,
+                        "gross_price": gross_price,
+                        "net_price": net_price,
+                        "discount_percent": discount,
+                        "line_total": line_total,
+                    }
+                )
+    finally:
+        doc.close()
+    return rows
+
+
+def _normalized_article_number(value) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def _apply_mcc_table_validation(pdf_text: str, pdf_bytes: bytes, extracted: dict) -> dict:
+    """Correct only verified MCC rows; every non-MCC document is returned untouched."""
+    if not _is_mcc_order_confirmation(pdf_text):
+        return extracted
+
+    parsed_rows = _extract_mcc_table_rows(pdf_bytes)
+    available_rows = list(parsed_rows)
+    corrected = 0
+
+    for line in extracted.get("VoucherLines", []):
+        line_number = _normalized_article_number(line.get("Number"))
+        if not line_number:
+            continue
+
+        matched_index = None
+        for index, row in enumerate(available_rows):
+            row_number = _normalized_article_number(row["number"])
+            if row_number == line_number or row_number.startswith(line_number) or line_number.startswith(row_number):
+                matched_index = index
+                break
+        if matched_index is None:
+            continue
+
+        row = available_rows.pop(matched_index)
+        replacements = {
+            "Quantity": row["quantity"],
+            "GrossPrice": row["gross_price"],
+            "DiscountPercent": row["discount_percent"],
+            "LineTotal": row["line_total"],
+        }
+        if row["unit"]:
+            replacements["DescriptionUnit"] = row["unit"]
+
+        if any(line.get(key) != value for key, value in replacements.items()):
+            corrected += 1
+        line.update(replacements)
+
+    extracted["MccValidatedLineCount"] = len(parsed_rows)
+    extracted["MccCorrectedLineCount"] = corrected
+    logger.info(
+        "MCC table validation completed: verified=%d, corrected=%d, extracted=%d",
+        len(parsed_rows),
+        corrected,
+        len(extracted.get("VoucherLines", [])),
+    )
+    return extracted
+
+
 def extract_order_data(pdf_text: str, pdf_bytes: bytes) -> dict:
     """
     Run LLM extraction, then enforce supplier fallback logic.
@@ -906,6 +1062,7 @@ def extract_order_data(pdf_text: str, pdf_bytes: bytes) -> dict:
     extracted = _recover_missing_numbered_lines(pdf_text, extracted)
     extracted = _apply_lt_delivery_weeks(pdf_text, extracted)
     extracted = _apply_delivery_date_fallbacks(pdf_text, extracted)
+    extracted = _apply_mcc_table_validation(pdf_text, pdf_bytes, extracted)
     total_pdf, curr_pdf = _extract_total_from_last_pdf_page(pdf_bytes)
     if total_pdf is None:
         total_pdf, curr_pdf = _extract_total_from_pdf_text(pdf_text)
@@ -966,10 +1123,17 @@ def build_summary(data: dict, file_name: str, folder_name: str) -> dict:
         discount = line.get("DiscountPercent")
         discount_pct = _as_float(discount, default=0.0) if discount is not None else None
         effective_price = unit_price if discount_pct is None else unit_price * (1 - (discount_pct / 100.0))
-        line_total = round(
-            _as_float(line.get("LineTotal"), default=quantity * effective_price),
-            2,
-        )
+        calculated_total = round(quantity * effective_price, 2)
+        line_total = round(_as_float(line.get("LineTotal"), default=calculated_total), 2)
+
+        # Guard against extraction choosing a printed gross amount instead of
+        # the discounted row subtotal. Only replace it when it matches the
+        # quantity x gross-price calculation within rounding tolerance.
+        if discount_pct is not None and discount_pct > 0 and quantity > 0:
+            gross_total = round(quantity * unit_price, 2)
+            tolerance = max(0.02, abs(gross_total) * 0.001)
+            if abs(line_total - gross_total) <= tolerance:
+                line_total = calculated_total
         total += line_total
 
         summary_lines.append(

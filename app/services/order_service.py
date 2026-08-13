@@ -164,8 +164,8 @@ def _save_skipped(
         """
         INSERT INTO orders
             (file_id, file_name, folder_name, pdf_url, supplier, status,
-             error_message, summary, attention, attention_reasons)
-        VALUES (%s, %s, %s, %s, 'SCHLAUCHSERVICE', 'skipped', %s, %s, FALSE, '[]'::jsonb)
+             error_message, summary, erp_article_no, attention, attention_reasons)
+        VALUES (%s, %s, %s, %s, 'SCHLAUCHSERVICE', 'skipped', %s, %s, '', FALSE, '[]'::jsonb)
         ON CONFLICT (file_id) DO UPDATE SET
             status='skipped',
             file_name=EXCLUDED.file_name,
@@ -179,7 +179,7 @@ def _save_skipped(
             erp_record_id=NULL,
             erp_voucher_number=NULL,
             erp_supplier_number=NULL,
-            erp_article_no=NULL,
+            erp_article_no='',
             attention=FALSE,
             attention_reasons='[]'::jsonb,
             processed_at=NOW()

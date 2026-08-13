@@ -145,24 +145,29 @@ def _truncate_decimals(value: float, decimals: int = 2) -> float:
 
 
 def _effective_unit_price(pdf_line: dict) -> float:
-    # 1) Prefer explicit extracted unit price from the PDF.
-    explicit = pdf_line.get("Price")
-    if explicit is not None:
-        return _as_float(explicit, default=0.0)
-
-    # 2) If line total is available, derive exact unit price from it.
-    qty = _as_float(pdf_line.get("Quantity", 0), default=0.0)
-    line_total_raw = (
-        pdf_line.get("LineTotal")
-        or pdf_line.get("Total")
-        or pdf_line.get("Amount")
-        or pdf_line.get("LineAmount")
+    # F016 must contain the gross/list "Preis" printed on the PDF. The ERP
+    # applies the separately supplied discount (F017) itself.
+    return _as_float(
+        pdf_line.get("GrossPrice", pdf_line.get("Price", 0)),
+        default=0.0,
     )
-    if line_total_raw is not None and qty > 0:
-        return round(_as_float(line_total_raw, default=0.0) / qty, 2)
 
-    # 3) Final fallback: use listed unit price directly from PDF (no percentage math).
-    return _as_float(pdf_line.get("GrossPrice", 0), default=0.0)
+    # Previous logic derived the unit price from the printed line total. This
+    # produced the discounted/net price in F016 (for example 42.70 / 2 = 21.35)
+    # instead of the required gross price (64.70).
+    # explicit = pdf_line.get("Price")
+    # if explicit is not None:
+    #     return _as_float(explicit, default=0.0)
+    # qty = _as_float(pdf_line.get("Quantity", 0), default=0.0)
+    # line_total_raw = (
+    #     pdf_line.get("LineTotal")
+    #     or pdf_line.get("Total")
+    #     or pdf_line.get("Amount")
+    #     or pdf_line.get("LineAmount")
+    # )
+    # if line_total_raw is not None and qty > 0:
+    #     return round(_as_float(line_total_raw, default=0.0) / qty, 2)
+    # return _as_float(pdf_line.get("GrossPrice", 0), default=0.0)
 
 
 def _resolve_surcharge_percent(pdf_line: dict, has_surcharge_column: bool = False) -> float:
@@ -191,7 +196,23 @@ def _effective_line_total(pdf_line: dict, unit_price: float, has_surcharge_colum
         or pdf_line.get("LineAmount")
     )
     if explicit_total is not None:
-        return round(_as_float(explicit_total, default=0.0), 2), 0.0
+        explicit_total_num = round(_as_float(explicit_total, default=0.0), 2)
+
+        # Some layouts (notably Nilfisk) print both the gross "Public price"
+        # amount and a discounted "Subtotal" amount. If extraction selects the
+        # gross amount as LineTotal, correct it only when the arithmetic clearly
+        # proves that it is quantity x gross price. Already-discounted totals and
+        # all non-discounted lines remain untouched.
+        quantity = _as_float(pdf_line.get("Quantity", 0), default=0.0)
+        discount_pct = _as_float(pdf_line.get("DiscountPercent"), default=0.0)
+        if quantity > 0 and discount_pct > 0 and not has_surcharge_column:
+            gross_total = round(quantity * unit_price, 2)
+            discounted_total = round(gross_total * (1 - (discount_pct / 100.0)), 2)
+            tolerance = max(0.02, abs(gross_total) * 0.001)
+            if abs(explicit_total_num - gross_total) <= tolerance:
+                return discounted_total, 0.0
+
+        return explicit_total_num, 0.0
 
     # 2) Fallback to qty * unit price.
     quantity = _as_float(pdf_line.get("Quantity", 0), default=0.0)
@@ -748,9 +769,16 @@ def push_to_erp(extracted: dict) -> dict:
                     }
                 )
         base_unit_price = _effective_unit_price(pdf_line)
-        unit_price, unit_factor, unit_price_resolution = _resolve_unit_price_and_factor(
-            pdf_line, base_unit_price
-        )
+        # Send the PDF's gross/list Preis directly to ERP field F016.
+        unit_price = base_unit_price
+        unit_factor = 1.0
+        unit_price_resolution = "direct_gross_price"
+
+        # Previous logic reconciled/divided the price using Einheit and the
+        # printed line total before sending it to F016.
+        # unit_price, unit_factor, unit_price_resolution = _resolve_unit_price_and_factor(
+        #     pdf_line, base_unit_price
+        # )
         erp_quantity = _as_float(matched.get("Quantity", 0), default=0.0)
         extracted_quantity = _as_float(pdf_line.get("Quantity", 0), default=0.0)
         qty_for_total = erp_quantity if erp_quantity > 0 else extracted_quantity
