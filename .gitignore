@@ -4,3 +4,12 @@ __pycache__/
 *.pyc
 
 myvenv/
+.venv/
+venv/
+
+.vscode/
+
+# Runtime copy of the downloadable supplier master workbook
+data/supplier address notebook.xlsx
+data/supplier address notebook.xlsx.lock
+
