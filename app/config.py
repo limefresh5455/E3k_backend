@@ -1,5 +1,6 @@
 import os
 import shutil
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -26,6 +27,20 @@ API_VERSION = "5.0.0"
 ERP_BASE_URL = os.getenv("ERP_BASE_URL", "https://e3k.teboag.ch:4433/e3k.Web")
 ERP_PASSWORD = os.getenv("ERP_PASSWORD")
 ERP_USERNAME = os.getenv("ERP_USERNAME")
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SUPPLIER_WORKBOOK_PATH = Path(
+    os.getenv(
+        "SUPPLIER_WORKBOOK_PATH",
+        str(PROJECT_ROOT / "data" / "supplier address notebook.xlsx"),
+    )
+)
+SUPPLIER_WORKBOOK_TEMPLATE_PATH = Path(
+    os.getenv(
+        "SUPPLIER_WORKBOOK_TEMPLATE_PATH",
+        str(PROJECT_ROOT / "app" / "supplier_addresses" / "templates" / "supplier address notebook.xlsx"),
+    )
+)
 
 
 def _resolve_tesseract_cmd() -> str:

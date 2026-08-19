@@ -6,3 +6,7 @@ __pycache__/
 myvenv/
 
 .vscode/
+
+# Runtime copy of the downloadable supplier master workbook
+data/supplier address notebook.xlsx
+data/supplier address notebook.xlsx.lock

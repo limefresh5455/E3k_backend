@@ -10,6 +10,7 @@ from app.api import api_router
 from app.config import API_TITLE, API_VERSION
 from app.db import init_db
 from app.services.erp_sync_job_service import trigger_sync
+from app.supplier_addresses.database import init_supplier_address_db
 
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -66,6 +67,7 @@ def _scheduled_sync_route_job():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    init_supplier_address_db()
     scheduler = None
 
     if ENABLE_SCHEDULER and not APSCHEDULER_AVAILABLE:

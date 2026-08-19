@@ -1055,6 +1055,7 @@ def extract_order_data(pdf_text: str, pdf_bytes: bytes) -> dict:
     """
     pdf_text = _preprocess_merged_positions(pdf_text)
     extracted = llm_extract(pdf_text)
+    extracted = _clear_discount_duplicated_line_totals(extracted)
     extracted["HasSurchargeColumn"] = bool(
         re.search(r"\b(aufschlag|surcharge)\b", pdf_text, flags=re.IGNORECASE)
     )
@@ -1107,6 +1108,51 @@ def _as_float(value, default: float = 0.0) -> float:
         return float(text)
     except (TypeError, ValueError):
         return default
+
+
+def _clear_discount_duplicated_line_totals(extracted: dict) -> dict:
+    """Remove a discount percentage that was also extracted as the row total.
+
+    Some confirmations end their item table with ``Rabatt %`` and do not print
+    a per-row amount.  In that layout an extraction model can copy the final
+    numeric cell into both ``DiscountPercent`` and ``LineTotal``.  Keeping that
+    value prevents the normal quantity x price x discount calculation later in
+    the pipeline.
+
+    Only clear the total when the two extracted values are equal and that value
+    does not already agree with the discounted arithmetic.  This keeps a real,
+    coincidentally equal printed total intact when it is mathematically valid.
+    """
+    for line in extracted.get("VoucherLines", []) or []:
+        raw_total = line.get("LineTotal")
+        raw_discount = line.get("DiscountPercent")
+        if raw_total is None or raw_discount is None:
+            continue
+
+        line_total = _as_float(raw_total, default=0.0)
+        discount_pct = _as_float(raw_discount, default=0.0)
+        if not (0 < discount_pct < 100) or abs(line_total - discount_pct) > 0.001:
+            continue
+
+        quantity = _as_float(line.get("Quantity"), default=0.0)
+        unit_price = _as_float(
+            line.get("GrossPrice", line.get("Price", line.get("NetPrice"))),
+            default=0.0,
+        )
+        calculated_total = round(quantity * unit_price * (1 - discount_pct / 100.0), 2)
+        tolerance = max(0.02, abs(calculated_total) * 0.001)
+        if quantity > 0 and unit_price > 0 and abs(line_total - calculated_total) > tolerance:
+            logger.warning(
+                "Discarding LineTotal duplicated from DiscountPercent: number=%s, "
+                "line_total=%s, discount_percent=%s, calculated_total=%s",
+                line.get("Number"),
+                raw_total,
+                raw_discount,
+                calculated_total,
+            )
+            line["LineTotal"] = None
+
+    return extracted
 
 
 def build_summary(data: dict, file_name: str, folder_name: str) -> dict:

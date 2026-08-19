@@ -6,6 +6,7 @@ from .health import router as health_router
 from .invoice import router as invoice_router
 from .orders import router as orders_router
 from .sync import router as sync_router
+from .suppliers import router as suppliers_router
 
 api_router = APIRouter()
 api_router.include_router(auth_router)
@@ -14,3 +15,4 @@ api_router.include_router(erp_sync_router)
 api_router.include_router(orders_router)
 api_router.include_router(health_router)
 api_router.include_router(invoice_router)
+api_router.include_router(suppliers_router)
