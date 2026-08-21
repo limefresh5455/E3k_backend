@@ -914,19 +914,6 @@ def push_to_erp(extracted: dict) -> dict:
             }
         )
 
-    recovered_line_count = int(extracted.get("RecoveredLineCount", 0) or 0)
-    if recovered_line_count > 0:
-        alerts.append(
-            {
-                "type": "lines_recovered_via_fallback",
-                "message": (
-                    "Prüfung erforderlich: Die erste Extraktion hat Zeile(n) übersehen, "
-                    "die von einem Fallback-Textparser wiederhergestellt werden mussten."
-                ),
-                "lines": [{"recovered_line_count": recovered_line_count}],
-            }
-        )
-
     if updated_count < expected_line_count:
         alerts.append(
             {

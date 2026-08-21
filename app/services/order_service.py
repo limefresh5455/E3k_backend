@@ -303,12 +303,10 @@ def _run_pipeline(
         # attention is ONLY set for the two things that should actually pull the client's
         # eye to the dashboard:
         #   1. format/pricing mismatch  -> PDF total doesn't match the calculated total
-        #   2. fewer lines than expected -> some PDF/PO lines are missing or were only
-        #      recovered via the fallback text-table parser
+        #   2. fewer lines than expected -> some PDF/PO lines are missing
         _ATTENTION_ALERT_TYPES = {
             "pdf_total_mismatch",
             "fewer_lines_than_expected",
-            "lines_recovered_via_fallback",
         }
         attention_alerts = [a for a in erp_alerts if a.get("type") in _ATTENTION_ALERT_TYPES]
         attention = bool(attention_alerts)
