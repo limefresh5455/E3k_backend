@@ -12,3 +12,7 @@ venv/
 # Runtime copy of the downloadable supplier master workbook
 data/supplier address notebook.xlsx
 data/supplier address notebook.xlsx.lock
+
+# Email automation runtime output
+logs/email_automation.log
+logs/email_automation_saved_paths.txt

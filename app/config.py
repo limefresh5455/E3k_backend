@@ -24,11 +24,50 @@ LOCAL_PDF_FOLDER = os.getenv("LOCAL_PDF_FOLDER", "temp_pdfs")
 API_TITLE = "Order Extractor API"
 API_VERSION = "5.0.0"
 
+# IMAP-to-pCloud email automation. This feature remains disabled until its
+# credentials are explicitly configured in the environment.
+EMAIL_AUTOMATION_ENABLED = os.getenv("EMAIL_AUTOMATION_ENABLED", "false").lower() == "true"
+EMAIL_AUTOMATION_SCHEDULE_HOUR = int(os.getenv("EMAIL_AUTOMATION_SCHEDULE_HOUR", "5"))
+EMAIL_AUTOMATION_SCHEDULE_MINUTE = int(os.getenv("EMAIL_AUTOMATION_SCHEDULE_MINUTE", "0"))
+
+IMAP_HOST = os.getenv("IMAP_HOST", "").strip()
+IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
+IMAP_USERNAME = os.getenv("IMAP_USERNAME", "").strip()
+IMAP_PASSWORD = os.getenv("IMAP_PASSWORD", "")
+IMAP_OAUTH2_TOKEN = os.getenv("IMAP_OAUTH2_TOKEN", "")
+IMAP_AUTH_METHOD = os.getenv("IMAP_AUTH_METHOD", "password").strip().lower()
+IMAP_FOLDER = os.getenv("IMAP_FOLDER", "INBOX").strip()
+IMAP_USE_SSL = os.getenv("IMAP_USE_SSL", "true").lower() == "true"
+IMAP_TIMEOUT_SECONDS = int(os.getenv("IMAP_TIMEOUT_SECONDS", "60"))
+
+PCLOUD_API_HOST = os.getenv("PCLOUD_API_HOST", "").strip().rstrip("/")
+PCLOUD_ACCESS_TOKEN = os.getenv("PCLOUD_ACCESS_TOKEN", "")
+PCLOUD_ROOT_FOLDER_ID = int(os.getenv("PCLOUD_ROOT_FOLDER_ID", "0"))
+PCLOUD_TIMEOUT_SECONDS = int(os.getenv("PCLOUD_TIMEOUT_SECONDS", "60"))
+
 ERP_BASE_URL = os.getenv("ERP_BASE_URL", "https://e3k.teboag.ch:4433/e3k.Web")
 ERP_PASSWORD = os.getenv("ERP_PASSWORD")
 ERP_USERNAME = os.getenv("ERP_USERNAME")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+EMAIL_AUTOMATION_EXCEL_FILE = Path(
+    os.getenv(
+        "EMAIL_AUTOMATION_EXCEL_FILE",
+        str(PROJECT_ROOT / "data" / "email_automation" / "alle-adressen1.xlsx"),
+    )
+)
+EMAIL_AUTOMATION_LOG_FILE = Path(
+    os.getenv(
+        "EMAIL_AUTOMATION_LOG_FILE",
+        str(PROJECT_ROOT / "logs" / "email_automation.log"),
+    )
+)
+EMAIL_AUTOMATION_PATH_LOG_FILE = Path(
+    os.getenv(
+        "EMAIL_AUTOMATION_PATH_LOG_FILE",
+        str(PROJECT_ROOT / "logs" / "email_automation_saved_paths.txt"),
+    )
+)
 SUPPLIER_WORKBOOK_PATH = Path(
     os.getenv(
         "SUPPLIER_WORKBOOK_PATH",
