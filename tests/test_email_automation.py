@@ -541,6 +541,37 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(len(exact), 2)
         self.assertNotIn("example.test", domains)
 
+    def test_capitalization_variants_use_first_folder_spelling(self):
+        excel = Path(self.temporary_directory.name) / "suppliers.xlsx"
+        pd.DataFrame(
+            [
+                ["Folder Name (supplier name)", "(email addresses)"],
+                ["HIFI Filter SA", "info.zu@hifi-filter.ch"],
+                ["HIFI FILTER SA", "info@hifi-filter.ch"],
+            ]
+        ).to_excel(excel, header=False, index=False)
+
+        exact, domains = load_supplier_mapping(excel, self.logger)
+
+        self.assertEqual(exact["info.zu@hifi-filter.ch"], "HIFI Filter SA")
+        self.assertEqual(exact["info@hifi-filter.ch"], "HIFI Filter SA")
+        self.assertEqual(domains["hifi-filter.ch"], "HIFI Filter SA")
+
+    def test_same_email_with_capitalization_variant_is_not_conflicting(self):
+        excel = Path(self.temporary_directory.name) / "suppliers.xlsx"
+        pd.DataFrame(
+            [
+                ["Folder Name (supplier name)", "(email addresses)"],
+                ["Supplier Name", "orders@supplier.test"],
+                ["SUPPLIER NAME", "orders@supplier.test"],
+            ]
+        ).to_excel(excel, header=False, index=False)
+
+        exact, domains = load_supplier_mapping(excel, self.logger)
+
+        self.assertEqual(exact["orders@supplier.test"], "Supplier Name")
+        self.assertEqual(domains["supplier.test"], "Supplier Name")
+
     def test_conflicting_email_mapping_is_disabled(self):
         excel = Path(self.temporary_directory.name) / "suppliers.xlsx"
         pd.DataFrame(

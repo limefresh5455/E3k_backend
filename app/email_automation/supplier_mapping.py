@@ -41,6 +41,8 @@ def load_supplier_mapping(
         frame.columns = ["folder", "email"]
 
         email_candidates: dict[str, set[str]] = {}
+        canonical_folders: dict[str, str] = {}
+        folder_variants: set[tuple[str, str]] = set()
         invalid_email_count = 0
         blank_email_count = 0
         blank_folder_count = 0
@@ -57,7 +59,15 @@ def load_supplier_mapping(
             if not EMAIL_PATTERN.fullmatch(email):
                 invalid_email_count += 1
                 continue
-            email_candidates.setdefault(email, set()).add(folder)
+
+            # pCloud folder names are compared case-insensitively. Treat Excel
+            # spellings that differ only by capitalization as the same supplier
+            # and preserve the first spelling as the canonical folder name.
+            folder_identity = folder.casefold()
+            canonical_folder = canonical_folders.setdefault(folder_identity, folder)
+            if folder != canonical_folder:
+                folder_variants.add((canonical_folder, folder))
+            email_candidates.setdefault(email, set()).add(canonical_folder)
 
         exact_map = {
             email: next(iter(folders))
@@ -92,6 +102,15 @@ def load_supplier_mapping(
             logger.warning("Ignored %d row(s) without a folder name", blank_folder_count)
         if invalid_email_count:
             logger.warning("Ignored %d row(s) containing invalid email values", invalid_email_count)
+        if folder_variants:
+            logger.info(
+                "Normalized %d capitalization-only supplier folder variant(s): %s",
+                len(folder_variants),
+                ", ".join(
+                    f"'{variant}' -> '{canonical}'"
+                    for canonical, variant in sorted(folder_variants)
+                ),
+            )
         if ambiguous_emails:
             logger.warning(
                 "Disabled %d email mapping(s) assigned to multiple folders: %s",
