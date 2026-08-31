@@ -1,10 +1,19 @@
 import hashlib
 import os
 import time
+from urllib.parse import urlencode
 
 import requests
 
 from app.config import LOCAL_PDF_FOLDER, PCLOUD_BASE_URL, PCLOUD_CODE
+
+
+class PCloudConfigurationError(RuntimeError):
+    """Raised when a pCloud viewer URL cannot be generated safely."""
+
+
+class PCloudViewLinkError(RuntimeError):
+    """Raised when pCloud cannot generate a direct file link."""
 
 
 def pcloud_get_folders():
@@ -24,19 +33,8 @@ def pcloud_download_pdf(file_id: str) -> bytes:
 
     for attempt in range(max_retries):
         try:
-            response = requests.get(
-                f"{PCLOUD_BASE_URL}/getpublinkdownload",
-                params={"code": PCLOUD_CODE, "fileid": file_id},
-                timeout=30,
-            )
-            data = response.json()
-
-            if data.get("result") != 0:
-                raise Exception(data)
-
-            host = data["hosts"][0]
-            path = data["path"]
-            file_response = requests.get(f"https://{host}{path}", timeout=60)
+            direct_url = pcloud_get_direct_url(file_id)
+            file_response = requests.get(direct_url, timeout=60)
 
             if file_response.status_code == 200:
                 return file_response.content
@@ -51,7 +49,46 @@ def pcloud_download_pdf(file_id: str) -> bytes:
 
 
 def pcloud_get_view_url(file_id: str) -> str:
-    return f"https://e.pcloud.com/#page=publink&code={PCLOUD_CODE}&fileid={file_id}"
+    public_link_code = str(PCLOUD_CODE or "").strip()
+    if not public_link_code:
+        raise PCloudConfigurationError("PCLOUD_CODE is not configured")
+
+    query = urlencode({"code": public_link_code, "fileid": str(file_id)})
+    return f"https://e.pcloud.com/#page=publink&{query}"
+
+
+def pcloud_get_direct_url(file_id: str) -> str:
+    """Ask pCloud for a temporary URL that opens the requested file itself."""
+    public_link_code = str(PCLOUD_CODE or "").strip()
+    if not public_link_code:
+        raise PCloudConfigurationError("PCLOUD_CODE is not configured")
+
+    try:
+        response = requests.get(
+            f"{PCLOUD_BASE_URL}/getpublinkdownload",
+            params={
+                "code": public_link_code,
+                "fileid": str(file_id),
+                "contenttype": "application/pdf",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError) as error:
+        raise PCloudViewLinkError("Could not request the PDF link from pCloud") from error
+
+    if data.get("result") != 0:
+        message = data.get("error", "unknown pCloud error")
+        raise PCloudViewLinkError(f"pCloud could not open this PDF: {message}")
+
+    hosts = data.get("hosts") or []
+    path = str(data.get("path") or "")
+    host = str(hosts[0]).strip().lower() if hosts else ""
+    if not host.endswith(".pcloud.com") or not path.startswith("/"):
+        raise PCloudViewLinkError("pCloud returned an invalid PDF link")
+
+    return f"https://{host}{path}"
 
 
 def get_local_pdfs():

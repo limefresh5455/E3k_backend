@@ -11,6 +11,8 @@ from app.config import (
     API_TITLE,
     API_VERSION,
     EMAIL_AUTOMATION_ENABLED,
+    EMAIL_AUTOMATION_SECOND_SCHEDULE_HOUR,
+    EMAIL_AUTOMATION_SECOND_SCHEDULE_MINUTE,
     EMAIL_AUTOMATION_SCHEDULE_HOUR,
     EMAIL_AUTOMATION_SCHEDULE_MINUTE,
 )
@@ -85,6 +87,31 @@ def _scheduled_email_automation_job():
         logger.exception("[SCHEDULER] Email automation failed: %s", exc)
 
 
+def _add_email_automation_jobs(scheduler, timezone):
+    schedules = (
+        (
+            "daily_email_automation",
+            EMAIL_AUTOMATION_SCHEDULE_HOUR,
+            EMAIL_AUTOMATION_SCHEDULE_MINUTE,
+        ),
+        (
+            "daily_email_automation_second",
+            EMAIL_AUTOMATION_SECOND_SCHEDULE_HOUR,
+            EMAIL_AUTOMATION_SECOND_SCHEDULE_MINUTE,
+        ),
+    )
+    for job_id, hour, minute in schedules:
+        scheduler.add_job(
+            _scheduled_email_automation_job,
+            trigger=CronTrigger(hour=hour, minute=minute, timezone=timezone),
+            id=job_id,
+            replace_existing=True,
+            misfire_grace_time=600,
+            coalesce=True,
+            max_instances=1,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -129,19 +156,7 @@ async def lifespan(app: FastAPI):
             coalesce=True,
         )
         if EMAIL_AUTOMATION_ENABLED:
-            scheduler.add_job(
-                _scheduled_email_automation_job,
-                trigger=CronTrigger(
-                    hour=EMAIL_AUTOMATION_SCHEDULE_HOUR,
-                    minute=EMAIL_AUTOMATION_SCHEDULE_MINUTE,
-                    timezone=de,
-                ),
-                id="daily_email_automation",
-                replace_existing=True,
-                misfire_grace_time=600,
-                coalesce=True,
-                max_instances=1,
-            )
+            _add_email_automation_jobs(scheduler, de)
         scheduler.start()
 
         next_run = scheduler.get_job("nightly_erp_wc_sync").next_run_time
@@ -163,14 +178,28 @@ async def lifespan(app: FastAPI):
         )
 
         if EMAIL_AUTOMATION_ENABLED:
-            email_next_run = scheduler.get_job("daily_email_automation").next_run_time
-            logger.info(
-                "[SCHEDULER] Email automation scheduled at %02d:%02d (%s). Next run: %s",
-                EMAIL_AUTOMATION_SCHEDULE_HOUR,
-                EMAIL_AUTOMATION_SCHEDULE_MINUTE,
-                DE_TIMEZONE,
-                email_next_run.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            email_schedules = (
+                (
+                    "daily_email_automation",
+                    EMAIL_AUTOMATION_SCHEDULE_HOUR,
+                    EMAIL_AUTOMATION_SCHEDULE_MINUTE,
+                ),
+                (
+                    "daily_email_automation_second",
+                    EMAIL_AUTOMATION_SECOND_SCHEDULE_HOUR,
+                    EMAIL_AUTOMATION_SECOND_SCHEDULE_MINUTE,
+                ),
             )
+            for job_id, hour, minute in email_schedules:
+                email_next_run = scheduler.get_job(job_id).next_run_time
+                logger.info(
+                    "[SCHEDULER] Email automation job '%s' scheduled at %02d:%02d (%s). Next run: %s",
+                    job_id,
+                    hour,
+                    minute,
+                    DE_TIMEZONE,
+                    email_next_run.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                )
 
     yield
 

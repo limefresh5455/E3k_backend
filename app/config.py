@@ -6,6 +6,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _read_bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be an integer") from error
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PCLOUD_CODE = os.getenv("PCLOUD_CODE", "kZJYSGZ8TaSQch9Ivb9ov25SMaKfmHODDvy")
 PCLOUD_BASE_URL = os.getenv("PCLOUD_BASE_URL", "https://eapi.pcloud.com")
@@ -27,8 +39,18 @@ API_VERSION = "5.0.0"
 # IMAP-to-pCloud email automation. This feature remains disabled until its
 # credentials are explicitly configured in the environment.
 EMAIL_AUTOMATION_ENABLED = os.getenv("EMAIL_AUTOMATION_ENABLED", "false").lower() == "true"
-EMAIL_AUTOMATION_SCHEDULE_HOUR = int(os.getenv("EMAIL_AUTOMATION_SCHEDULE_HOUR", "5"))
-EMAIL_AUTOMATION_SCHEDULE_MINUTE = int(os.getenv("EMAIL_AUTOMATION_SCHEDULE_MINUTE", "0"))
+EMAIL_AUTOMATION_SCHEDULE_HOUR = _read_bounded_int(
+    "EMAIL_AUTOMATION_SCHEDULE_HOUR", 5, 0, 23
+)
+EMAIL_AUTOMATION_SCHEDULE_MINUTE = _read_bounded_int(
+    "EMAIL_AUTOMATION_SCHEDULE_MINUTE", 0, 0, 59
+)
+EMAIL_AUTOMATION_SECOND_SCHEDULE_HOUR = _read_bounded_int(
+    "EMAIL_AUTOMATION_SECOND_SCHEDULE_HOUR", 12, 0, 23
+)
+EMAIL_AUTOMATION_SECOND_SCHEDULE_MINUTE = _read_bounded_int(
+    "EMAIL_AUTOMATION_SECOND_SCHEDULE_MINUTE", 30, 0, 59
+)
 
 IMAP_HOST = os.getenv("IMAP_HOST", "").strip()
 IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))

@@ -4,14 +4,24 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 from app.db import get_conn
 from app.services.erp_service import push_to_erp
 from app.services.extraction_service import build_summary, extract_order_data, extract_text_from_bytes
-from app.services.pcloud_service import pcloud_download_pdf, pcloud_get_folders, pcloud_get_view_url
+from app.services.pcloud_service import (
+    pcloud_download_pdf,
+    pcloud_get_direct_url,
+    pcloud_get_folders,
+    pcloud_get_view_url,
+)
 
 semaphore = asyncio.Semaphore(2)
 logger = logging.getLogger("order_service")
+
+
+class OrderPdfNotAvailableError(RuntimeError):
+    """Raised when an order does not point to a PDF stored in pCloud."""
 
 
 def is_already_processed(file_id: str) -> bool:
@@ -445,6 +455,32 @@ def get_order_by_number(order_number: str):
     cur.close()
     conn.close()
     return dict(row) if row else None
+
+
+def get_order_pdf_view(order_id: int):
+    """Return safe pCloud viewer metadata for an order, if it has a pCloud PDF."""
+    order = get_order(order_id)
+    if not order:
+        return None
+
+    stored_url = str(order.get("pdf_url") or "").strip()
+    parsed_url = urlsplit(stored_url)
+    if parsed_url.scheme != "https" or parsed_url.hostname != "e.pcloud.com":
+        raise OrderPdfNotAvailableError(
+            "This order's PDF is not stored in pCloud."
+        )
+
+    file_id = str(order.get("file_id") or "").strip()
+    if not file_id.isdecimal():
+        raise OrderPdfNotAvailableError(
+            "This order does not have a valid pCloud file ID."
+        )
+
+    return {
+        "order_id": int(order["id"]),
+        "file_name": str(order.get("file_name") or ""),
+        "view_url": pcloud_get_direct_url(file_id),
+    }
 
 
 def update_order_line_after_manual_correction(
