@@ -115,11 +115,25 @@ class PCloudClient:
 
         try:
             metadata = data["metadata"][0]
-            file_id = int(metadata["fileid"])
-            cloud_path = str(metadata["path"])
-            remote_size = int(metadata["size"])
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            if not isinstance(metadata, dict):
+                raise TypeError("file metadata was not an object")
+        except (KeyError, IndexError, TypeError) as exc:
             raise PCloudError("pCloud upload response was missing file metadata") from exc
+
+        try:
+            file_id = int(metadata["fileid"])
+            remote_size = int(metadata["size"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PCloudError(
+                "pCloud upload response was missing required file ID or size metadata"
+            ) from exc
+
+        # pCloud may omit the optional full path when the destination is
+        # identified by folder ID. The folder ID above already controls where
+        # the file is stored, so use the returned/sent name for local history.
+        cloud_path = str(
+            metadata.get("path") or metadata.get("name") or cloud_filename
+        )
 
         local_size = file_path.stat().st_size
         if remote_size != local_size:

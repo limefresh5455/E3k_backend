@@ -470,6 +470,90 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(upload_data["nopartial"], 1)
         self.assertNotIn("renameifexists", upload_data)
 
+    def test_pcloud_upload_accepts_metadata_without_optional_path(self):
+        pdf = Path(self.temporary_directory.name) / "test.pdf"
+        pdf.write_bytes(b"%PDF-test")
+        session = FakeSession(
+            [
+                {"result": 0, "metadata": {"folderid": 55}},
+                {"result": 0, "metadata": {"contents": []}},
+                {
+                    "result": 0,
+                    "metadata": [
+                        {
+                            "fileid": 77,
+                            "name": "test.pdf",
+                            "size": pdf.stat().st_size,
+                        }
+                    ],
+                },
+            ]
+        )
+        client = PCloudClient("https://eapi.pcloud.com", "secret", 10, session=session)
+
+        result = client.upload_pdf(pdf, "Supplier", "test.pdf", "unused")
+
+        self.assertEqual(result.status, "uploaded")
+        self.assertEqual(result.file_id, 77)
+        self.assertEqual(result.cloud_path, "test.pdf")
+        self.assertEqual(result.size, pdf.stat().st_size)
+
+    def test_email_is_completed_when_upload_metadata_omits_path(self):
+        payload = b"%PDF-1.4 test-content-0"
+        cloud_filename = (
+            f"2026-08-24_{hashlib.sha256(payload).hexdigest()[:12]}_order.pdf"
+        )
+        session = FakeSession(
+            [
+                {"result": 0, "metadata": {"folderid": 55}},
+                {"result": 0, "metadata": {"contents": []}},
+                {
+                    "result": 0,
+                    "metadata": [
+                        {
+                            "fileid": 77,
+                            "name": cloud_filename,
+                            "size": len(payload),
+                        }
+                    ],
+                },
+            ]
+        )
+        client = PCloudClient("https://eapi.pcloud.com", "secret", 10, session=session)
+        imap = FakeImap({"7": make_email()})
+
+        stats = process_emails(
+            imap,
+            {"orders@supplier.test": "Supplier A"},
+            {},
+            client,
+            self.history,
+            self.logger,
+        )
+
+        self.assertEqual(stats["pdfs_uploaded"], 1)
+        self.assertEqual(stats["duplicates"], 0)
+        self.assertEqual(stats["errors"], 0)
+        self.assertEqual(stats["saved_paths"], [cloud_filename])
+        self.assertEqual(imap.seen, ["7"])
+        self.assertEqual(len(self.history.uploads), 1)
+        self.assertIn(imap.fetch("7").key, self.history.messages)
+
+    def test_pcloud_upload_still_requires_file_id_and_size(self):
+        pdf = Path(self.temporary_directory.name) / "test.pdf"
+        pdf.write_bytes(b"%PDF-test")
+        session = FakeSession(
+            [
+                {"result": 0, "metadata": {"folderid": 55}},
+                {"result": 0, "metadata": {"contents": []}},
+                {"result": 0, "metadata": [{"name": "test.pdf"}]},
+            ]
+        )
+        client = PCloudClient("https://eapi.pcloud.com", "secret", 10, session=session)
+
+        with self.assertRaisesRegex(PCloudError, "required file ID or size"):
+            client.upload_pdf(pdf, "Supplier", "test.pdf", "unused")
+
     def test_pcloud_rejects_same_name_with_different_checksum(self):
         pdf = Path(self.temporary_directory.name) / "test.pdf"
         pdf.write_bytes(b"%PDF-local")
