@@ -11,7 +11,7 @@ from app.services.erp_service import push_to_erp
 from app.services.extraction_service import build_summary, extract_order_data, extract_text_from_bytes
 from app.services.pcloud_service import (
     pcloud_download_pdf,
-    pcloud_get_direct_url,
+    pcloud_get_file_preview_url,
     pcloud_get_folders,
     pcloud_get_view_url,
 )
@@ -479,7 +479,8 @@ def get_order_pdf_view(order_id: int):
     return {
         "order_id": int(order["id"]),
         "file_name": str(order.get("file_name") or ""),
-        "view_url": pcloud_get_direct_url(file_id),
+        # Open exactly this PDF in pCloud's standalone document viewer.
+        "view_url": pcloud_get_file_preview_url(file_id),
     }
 
 
