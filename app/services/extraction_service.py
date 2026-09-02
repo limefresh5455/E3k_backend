@@ -6,6 +6,7 @@ import re
 import time
 import unicodedata
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_HALF_UP
 
 import fitz  # PyMuPDF
 import pdfplumber
@@ -185,6 +186,7 @@ IMPORTANT RULES:
 - "GrossPrice": the unit LIST price exactly as printed on the PDF — do NOT apply any discount to it.
   Leave the arithmetic to the ERP. If only a net price is shown (no discount column), put it in GrossPrice and leave DiscountPercent null.
 - "DiscountPercent": the discount percentage exactly as printed (e.g. 33, 35). Set to null if not shown.
+  A numeric value in a VAT column (for example 49 after the Amount column) is a VAT code, not a discount.
   NEVER pre-calculate net price. NEVER put a calculated value in GrossPrice.
 - "Quantity": number of units ordered
 - "Einheit": pricing unit factor column (e.g. 1, 10, 100). If a row price is per 100 pieces, set Einheit=100.
@@ -896,12 +898,12 @@ def _is_mcc_order_confirmation(pdf_text: str) -> bool:
     """Recognize MCC's order-confirmation table without relying on supplier extraction."""
     normalized = re.sub(r"\s+", " ", pdf_text or "").casefold()
     signatures = (
-        "mcc millennium coupling",
-        "netto preis",
-        "gesamtpreis",
-        "preis/me",
+        r"mcc\s+millennium\s+coupling",
+        r"netto\s*preis",
+        r"gesamt\s*preis",
+        r"preis\s*/\s*me",
     )
-    return all(signature in normalized for signature in signatures)
+    return all(re.search(signature, normalized) for signature in signatures)
 
 
 def _mcc_number(value: str) -> float | None:
@@ -909,6 +911,82 @@ def _mcc_number(value: str) -> float | None:
     if not match:
         return None
     return _as_float(match.group(0), default=0.0)
+
+
+MCC_DEFAULT_DISCOUNT_PERCENT = Decimal("55")
+MCC_SALES_MULTIPLIER = Decimal("4")
+SWISS_VAT_MULTIPLIER = Decimal("1.081")
+
+
+def _round_up_to_ten_rappen(value: Decimal) -> Decimal:
+    """Round a positive amount upward to the next 0.10 boundary."""
+    return value.quantize(Decimal("0.1"), rounding=ROUND_CEILING)
+
+
+def _calculate_mcc_sales_prices(
+    gross_price: float,
+    printed_net_price: float,
+    discount_percent: float | None,
+) -> dict | None:
+    """Validate an MCC purchase price and calculate its net/gross sale prices."""
+    try:
+        gross = Decimal(str(gross_price))
+        printed_net = Decimal(str(printed_net_price))
+        supplied_discount = (
+            None if discount_percent is None else Decimal(str(discount_percent))
+        )
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+    if gross <= 0 or printed_net <= 0:
+        return None
+
+    default_applied = supplied_discount is None
+    effective_discount = (
+        MCC_DEFAULT_DISCOUNT_PERCENT
+        if supplied_discount is None
+        else supplied_discount
+    )
+    if effective_discount < 0 or effective_discount >= 100:
+        return None
+
+    expected_net = gross * (Decimal("1") - effective_discount / Decimal("100"))
+    if abs(printed_net - expected_net) > Decimal("0.02"):
+        return None
+
+    # Keep the PDF's rounded net price as a cross-check, but calculate from the
+    # exact list-price/discount result as requested by the supplier rule.
+    sales_price_net = _round_up_to_ten_rappen(expected_net * MCC_SALES_MULTIPLIER)
+    sales_price_gross = _round_up_to_ten_rappen(
+        sales_price_net * SWISS_VAT_MULTIPLIER
+    )
+    return {
+        "discount_percent": float(effective_discount),
+        "default_discount_applied": default_applied,
+        "discount_differs_from_default": (
+            not default_applied
+            and effective_discount != MCC_DEFAULT_DISCOUNT_PERCENT
+        ),
+        "purchase_net_price": float(expected_net),
+        "sales_price_net": float(sales_price_net),
+        "sales_price_gross": float(sales_price_gross),
+    }
+
+
+def _mcc_line_total_matches(
+    quantity: float,
+    exact_unit_price: float,
+    printed_line_total: float,
+) -> bool:
+    """Check the PDF total using MCC's exact discounted unit price."""
+    try:
+        expected_total = (
+            Decimal(str(quantity)) * Decimal(str(exact_unit_price))
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        printed_total = Decimal(str(printed_line_total))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return printed_total == expected_total
 
 
 def _extract_mcc_table_rows(pdf_bytes: bytes) -> list[dict]:
@@ -956,27 +1034,47 @@ def _extract_mcc_table_rows(pdf_bytes: bytes) -> list[dict]:
                     if row_y < word[1] < next_y and 375 <= word[0] < 430
                 ]
                 discount_text = " ".join(word[4] for word in sorted(discount_words, key=lambda w: (w[1], w[0])))
-                discount_match = re.search(r"(\d+(?:[.,]\d+)?)\s*%", discount_text)
-                if not discount_match:
-                    continue
+                discount_candidates = [
+                    _mcc_number(match.group(1))
+                    for match in re.finditer(r"(\d+(?:[.,]\d+)?)\s*%", discount_text)
+                ]
 
                 quantity_token = "".join(quantity_parts)
                 quantity = _mcc_number(quantity_token)
                 gross_price = _mcc_number("".join(gross_parts))
                 net_price = _mcc_number("".join(net_parts))
                 line_total = _mcc_number("".join(total_parts))
-                discount = _mcc_number(discount_match.group(1))
-                if None in (quantity, gross_price, net_price, line_total, discount):
+                if None in (quantity, gross_price, net_price, line_total):
                     continue
 
                 # Accept a row only when both independent price relationships
                 # agree with the printed values. This prevents column-position
                 # assumptions from silently changing an unfamiliar layout.
-                expected_net = gross_price * (1 - (discount / 100.0))
-                expected_total = quantity * expected_net
-                if abs(net_price - expected_net) > 0.02:
+                pricing = None
+                # A row may contain more than one percentage in its vertical
+                # region. Select only a percentage whose arithmetic agrees with
+                # the printed net price. If none does, try MCC's 55% default.
+                for discount in discount_candidates:
+                    pricing = _calculate_mcc_sales_prices(
+                        gross_price,
+                        net_price,
+                        discount,
+                    )
+                    if pricing is not None:
+                        break
+                if pricing is None:
+                    pricing = _calculate_mcc_sales_prices(
+                        gross_price,
+                        net_price,
+                        None,
+                    )
+                if pricing is None:
                     continue
-                if abs(line_total - expected_total) > 0.03:
+                if not _mcc_line_total_matches(
+                    quantity,
+                    pricing["purchase_net_price"],
+                    line_total,
+                ):
                     continue
 
                 unit_match = re.search(r"[A-Za-zÄÖÜäöü]+", quantity_token)
@@ -987,7 +1085,7 @@ def _extract_mcc_table_rows(pdf_bytes: bytes) -> list[dict]:
                         "unit": unit_match.group(0) if unit_match else None,
                         "gross_price": gross_price,
                         "net_price": net_price,
-                        "discount_percent": discount,
+                        **pricing,
                         "line_total": line_total,
                     }
                 )
@@ -1005,6 +1103,7 @@ def _apply_mcc_table_validation(pdf_text: str, pdf_bytes: bytes, extracted: dict
     if not _is_mcc_order_confirmation(pdf_text):
         return extracted
 
+    extracted["IsMccOrderConfirmation"] = True
     parsed_rows = _extract_mcc_table_rows(pdf_bytes)
     available_rows = list(parsed_rows)
     corrected = 0
@@ -1029,7 +1128,15 @@ def _apply_mcc_table_validation(pdf_text: str, pdf_bytes: bytes, extracted: dict
             "GrossPrice": row["gross_price"],
             "DiscountPercent": row["discount_percent"],
             "LineTotal": row["line_total"],
+            "MccPurchaseNetPrice": row["purchase_net_price"],
+            "MccDefaultDiscountApplied": row["default_discount_applied"],
+            "MccDiscountDiffersFromDefault": row["discount_differs_from_default"],
         }
+        if line_number == "VERSCH":
+            replacements["MccSalesPriceExcluded"] = True
+        else:
+            replacements["MccSalesPriceNet"] = row["sales_price_net"]
+            replacements["MccSalesPriceGross"] = row["sales_price_gross"]
         if row["unit"]:
             replacements["DescriptionUnit"] = row["unit"]
 
@@ -1055,6 +1162,7 @@ def extract_order_data(pdf_text: str, pdf_bytes: bytes) -> dict:
     """
     pdf_text = _preprocess_merged_positions(pdf_text)
     extracted = llm_extract(pdf_text)
+    extracted = _correct_vat_code_misread_as_discount(pdf_text, extracted)
     extracted = _clear_discount_duplicated_line_totals(extracted)
     extracted["HasSurchargeColumn"] = bool(
         re.search(r"\b(aufschlag|surcharge)\b", pdf_text, flags=re.IGNORECASE)
@@ -1108,6 +1216,38 @@ def _as_float(value, default: float = 0.0) -> float:
         return float(text)
     except (TypeError, ValueError):
         return default
+
+
+def _correct_vat_code_misread_as_discount(pdf_text: str, extracted: dict) -> dict:
+    """Correct VAT code 49 misread as a discount in the Tubi net-price layout."""
+    normalized_text = re.sub(r"\s+", " ", pdf_text or "").casefold()
+    table_header = re.compile(
+        r"prcis\s+m\.?\s*u\.?\s+quantity\s+price\s+disco\s+amount\s+vat\s+delivery"
+    )
+    if not table_header.search(normalized_text):
+        return extracted
+
+    corrected = 0
+    for line in extracted.get("VoucherLines", []) or []:
+        if abs(_as_float(line.get("DiscountPercent"), default=0.0) - 49.0) > 0.001:
+            continue
+
+        line["DiscountPercent"] = None
+        quantity = _as_float(line.get("Quantity"), default=0.0)
+        unit_price = _as_float(
+            line.get("GrossPrice", line.get("Price", line.get("NetPrice"))),
+            default=0.0,
+        )
+        if quantity > 0 and unit_price > 0:
+            line["LineTotal"] = round(quantity * unit_price, 2)
+        corrected += 1
+
+    if corrected:
+        logger.info(
+            "Corrected VAT code 49 misread as discount in net-price table: lines=%d",
+            corrected,
+        )
+    return extracted
 
 
 def _clear_discount_duplicated_line_totals(extracted: dict) -> dict:

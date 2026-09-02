@@ -317,6 +317,9 @@ def _run_pipeline(
         _ATTENTION_ALERT_TYPES = {
             "pdf_total_mismatch",
             "fewer_lines_than_expected",
+            "mcc_discount_differs_from_default",
+            "mcc_sales_price_update_failed",
+            "mcc_sales_price_validation_failed",
         }
         attention_alerts = [a for a in erp_alerts if a.get("type") in _ATTENTION_ALERT_TYPES]
         attention = bool(attention_alerts)
@@ -341,7 +344,15 @@ def _run_pipeline(
             attention_reasons=attention_reasons,
             status=order_status,
         )
-        mark_as_processed(file_id, file_name)
+        # A transient/verification failure while saving MCC article prices must
+        # be retried on the next sync. Validation warnings are processed once
+        # because repeating extraction cannot repair an invalid PDF value.
+        retry_mcc_sales_prices = any(
+            alert.get("type") == "mcc_sales_price_update_failed"
+            for alert in erp_alerts
+        )
+        if not retry_mcc_sales_prices:
+            mark_as_processed(file_id, file_name)
 
         return {
             "status": order_status,
@@ -353,6 +364,7 @@ def _run_pipeline(
             "erp_voucher_number": erp_result.get("voucher_number"),
             "erp_supplier_number": erp_result.get("supplier_number"),
             "erp_article_no": erp_result.get("erp_article_numbers"),
+            "retry_required": retry_mcc_sales_prices,
         }
 
     except Exception as error:

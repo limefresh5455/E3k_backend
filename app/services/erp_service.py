@@ -4,6 +4,7 @@ import math
 import re
 import time
 from typing import Optional
+from urllib.parse import quote
 
 import requests
 
@@ -612,6 +613,89 @@ def _update_voucher_line(
     return str(body)
 
 
+def _update_article_sales_prices(
+    *,
+    article_number: str,
+    sales_price_net: float,
+    sales_price_gross: float,
+) -> str:
+    """Update the two sale-price fields on an ERP article master record."""
+    article_number = str(article_number or "").strip()
+    net = _as_float(sales_price_net, default=0.0)
+    gross = _as_float(sales_price_gross, default=0.0)
+    if not article_number:
+        raise ValueError("ERP article number is required for the sales-price update.")
+    if net <= 0 or gross <= 0:
+        raise ValueError(
+            f"Invalid MCC sales prices for article '{article_number}': net={net}, gross={gross}"
+        )
+
+    payload = {
+        "F001": article_number,
+        "F032": f"{net:.2f}",
+        "F033": f"{gross:.2f}",
+    }
+    logger.info("ERP Article sales-price update payload: %s", payload)
+    response = _erp_request(
+        "PUT",
+        f"{ERP_BASE_URL}/api/Article/Update",
+        context=f"Article/Update sales prices (article={article_number})",
+        json=payload,
+        auth=_auth(),
+    )
+    if not response.ok:
+        raise Exception(
+            f"ERP Article UPDATE failed ({response.status_code}) for article "
+            f"'{article_number}': {response.text[:1500]}"
+        )
+
+    body = response.json()
+    if isinstance(body, dict) and "Message" in body:
+        raise Exception(
+            f"ERP article sales-price update error: {body.get('Message')} | "
+            f"{body.get('Errors', [])}"
+        )
+    record_id = str(body).strip()
+    if not record_id.isdigit() or int(record_id) <= 0:
+        raise Exception(
+            f"ERP returned an invalid sales-price update result for article "
+            f"'{article_number}': {body!r}"
+        )
+
+    verify_response = _erp_request(
+        "POST",
+        f"{ERP_BASE_URL}/api/Article/Key/{quote(article_number, safe='')}",
+        context=f"Article/Key sales-price verification (article={article_number})",
+        json=["F032", "F033"],
+        auth=_auth(),
+    )
+    if not verify_response.ok:
+        raise Exception(
+            f"ERP Article verification failed ({verify_response.status_code}) for "
+            f"article '{article_number}': {verify_response.text[:1500]}"
+        )
+    saved = verify_response.json()
+    if not isinstance(saved, dict):
+        raise Exception(
+            f"ERP returned an invalid sales-price verification result for article "
+            f"'{article_number}': {saved!r}"
+        )
+    saved_net = _as_float(saved.get("F032"), default=float("nan"))
+    saved_gross = _as_float(saved.get("F033"), default=float("nan"))
+    if (
+        not math.isfinite(saved_net)
+        or not math.isfinite(saved_gross)
+        or abs(saved_net - net) > 0.001
+        or abs(saved_gross - gross) > 0.001
+    ):
+        raise Exception(
+            f"ERP sales-price verification mismatch for article '{article_number}': "
+            f"expected F032={net:.2f}, F033={gross:.2f}; "
+            f"received F032={saved.get('F032')!r}, F033={saved.get('F033')!r}"
+        )
+    return record_id
+
+
 def push_manual_line_update(
     *,
     voucher_number: str,
@@ -722,11 +806,16 @@ def push_to_erp(extracted: dict) -> dict:
     long_delivery_alert_lines: list[dict] = []
     surcharge_alert_lines: list[dict] = []
     quantity_mismatch_alert_lines: list[dict] = []
+    mcc_discount_alert_lines: list[dict] = []
+    mcc_sales_price_validation_lines: list[dict] = []
+    mcc_sales_price_error_lines: list[dict] = []
+    mcc_sales_price_updates: dict[str, dict[str, float | str]] = {}
     updated_line_totals: dict[str, float] = {}
     updated_line_quantities: dict[str, float] = {}
     updated_line_erp_article_numbers: dict[str, str] = {}
     calculated_total = 0.0
     updated_count = 0
+    is_mcc_order = bool(extracted.get("IsMccOrderConfirmation"))
     has_surcharge_column = bool(extracted.get("HasSurchargeColumn"))
     order_date_dt = None
     order_date_raw = extracted.get("OrderDate") or extracted.get("VoucherDate")
@@ -850,6 +939,72 @@ def push_to_erp(extracted: dict) -> dict:
         )
         updated_ids.append(updated_id)
         updated_pdf_numbers.append(pdf_num)
+        mcc_sales_price_net = pdf_line.get("MccSalesPriceNet")
+        mcc_sales_price_gross = pdf_line.get("MccSalesPriceGross")
+        mcc_sales_price_excluded = bool(pdf_line.get("MccSalesPriceExcluded"))
+        if pdf_line.get("MccDiscountDiffersFromDefault"):
+            mcc_discount_alert_lines.append(
+                {
+                    "article_number": erp_article_number,
+                    "discount_percent": _as_float(pdf_line.get("DiscountPercent")),
+                    "default_discount_percent": 55.0,
+                }
+            )
+        if (
+            is_mcc_order
+            and not mcc_sales_price_excluded
+            and mcc_sales_price_net is not None
+            and mcc_sales_price_gross is not None
+        ):
+            proposed_prices = {
+                "net": round(_as_float(mcc_sales_price_net), 2),
+                "gross": round(_as_float(mcc_sales_price_gross), 2),
+            }
+            previous_update = mcc_sales_price_updates.get(erp_article_number)
+            if previous_update is None:
+                try:
+                    article_record_id = _update_article_sales_prices(
+                        article_number=erp_article_number,
+                        sales_price_net=proposed_prices["net"],
+                        sales_price_gross=proposed_prices["gross"],
+                    )
+                    mcc_sales_price_updates[erp_article_number] = {
+                        **proposed_prices,
+                        "erp_record_id": article_record_id,
+                    }
+                except Exception as exc:
+                    logger.exception(
+                        "MCC sales-price update failed for ERP article=%s",
+                        erp_article_number,
+                    )
+                    mcc_sales_price_error_lines.append(
+                        {
+                            "article_number": erp_article_number,
+                            **proposed_prices,
+                            "error": str(exc),
+                        }
+                    )
+            elif (
+                previous_update.get("net") != proposed_prices["net"]
+                or previous_update.get("gross") != proposed_prices["gross"]
+            ):
+                mcc_sales_price_error_lines.append(
+                    {
+                        "article_number": erp_article_number,
+                        **proposed_prices,
+                        "error": "Conflicting MCC sales prices for the same article in one order.",
+                    }
+                )
+        elif is_mcc_order and not mcc_sales_price_excluded:
+            mcc_sales_price_validation_lines.append(
+                {
+                    "article_number": erp_article_number,
+                    "error": (
+                        "MCC gross price, discount, printed net price, or line total "
+                        "did not pass the sales-price cross-check."
+                    ),
+                }
+            )
         if surcharge_pct_applied > 0:
             surcharge_alert_lines.append(
                 {
@@ -911,6 +1066,30 @@ def push_to_erp(extracted: dict) -> dict:
                 "type": "quantity_mismatch",
                 "message": "Prüfung erforderlich: Die Menge im PDF weicht von der ERP-Bestellmenge ab. Für die Summen wurde die ERP-Menge verwendet.",
                 "lines": quantity_mismatch_alert_lines,
+            }
+        )
+    if mcc_discount_alert_lines:
+        alerts.append(
+            {
+                "type": "mcc_discount_differs_from_default",
+                "message": "Prüfung erforderlich: Der MCC-Rabatt weicht vom Standardwert 55 % ab; für die Verkaufspreise wurde der im Dokument angegebene Rabatt verwendet.",
+                "lines": mcc_discount_alert_lines,
+            }
+        )
+    if mcc_sales_price_error_lines:
+        alerts.append(
+            {
+                "type": "mcc_sales_price_update_failed",
+                "message": "Prüfung erforderlich: Mindestens ein berechneter MCC-Verkaufspreis konnte nicht im ERP-Artikel gespeichert werden.",
+                "lines": mcc_sales_price_error_lines,
+            }
+        )
+    if mcc_sales_price_validation_lines:
+        alerts.append(
+            {
+                "type": "mcc_sales_price_validation_failed",
+                "message": "Prüfung erforderlich: Mindestens eine MCC-Zeile konnte nicht sicher für die Verkaufspreise validiert werden.",
+                "lines": mcc_sales_price_validation_lines,
             }
         )
 
@@ -977,6 +1156,7 @@ def push_to_erp(extracted: dict) -> dict:
             "updated_line_totals": updated_line_totals,
             "updated_line_quantities": updated_line_quantities,
             "updated_line_erp_article_numbers": updated_line_erp_article_numbers,
+            "mcc_sales_price_updates": mcc_sales_price_updates,
             "requires_double_check": bool(alerts),
             "alerts": alerts,
         },

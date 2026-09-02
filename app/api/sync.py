@@ -88,7 +88,15 @@ async def sync_pcloud():
 
                 tasks.append(asyncio.to_thread(process_file, file_id, file_name, folder_name))
 
-    responses = await asyncio.gather(*tasks, return_exceptions=True)
+    # Preserve the order in which PDFs are returned/shown by pCloud. Article
+    # sale prices are master data, so concurrent MCC documents for the same
+    # article must not race and leave an unpredictable final value.
+    responses = []
+    for task in tasks:
+        try:
+            responses.append(await task)
+        except Exception as error:
+            responses.append(error)
     for response in responses:
         results["processed"] += 1
 
