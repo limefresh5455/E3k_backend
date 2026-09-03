@@ -17,5 +17,4 @@ data/supplier address notebook.xlsx.lock
 logs/email_automation.log
 logs/email_automation_saved_paths.txt
 
-# Email automation supplier address workbook (local/private data)
-data/email_automation/alle-adressen1.xlsx
+
