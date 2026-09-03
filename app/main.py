@@ -11,8 +11,8 @@ from app.config import (
     API_TITLE,
     API_VERSION,
     EMAIL_AUTOMATION_ENABLED,
-    # EMAIL_AUTOMATION_SECOND_SCHEDULE_HOUR,
-    # EMAIL_AUTOMATION_SECOND_SCHEDULE_MINUTE,
+    EMAIL_AUTOMATION_SECOND_SCHEDULE_HOUR,
+    EMAIL_AUTOMATION_SECOND_SCHEDULE_MINUTE,
     EMAIL_AUTOMATION_SCHEDULE_HOUR,
     EMAIL_AUTOMATION_SCHEDULE_MINUTE,
 )
@@ -94,13 +94,11 @@ def _add_email_automation_jobs(scheduler, timezone):
             EMAIL_AUTOMATION_SCHEDULE_HOUR,
             EMAIL_AUTOMATION_SCHEDULE_MINUTE,
         ),
-        # The second 12:30 CET run is temporarily manual. To restore it, uncomment
-        # this block and the matching imports near the top of this file.
-        # (
-        #     "daily_email_automation_second",
-        #     EMAIL_AUTOMATION_SECOND_SCHEDULE_HOUR,
-        #     EMAIL_AUTOMATION_SECOND_SCHEDULE_MINUTE,
-        # ),
+        (
+            "daily_email_automation_second",
+            EMAIL_AUTOMATION_SECOND_SCHEDULE_HOUR,
+            EMAIL_AUTOMATION_SECOND_SCHEDULE_MINUTE,
+        ),
     )
     for job_id, hour, minute in schedules:
         scheduler.add_job(
@@ -186,13 +184,11 @@ async def lifespan(app: FastAPI):
                     EMAIL_AUTOMATION_SCHEDULE_HOUR,
                     EMAIL_AUTOMATION_SCHEDULE_MINUTE,
                 ),
-                # The second 12:30 CET run is temporarily manual. To restore it,
-                # uncomment this block and the matching imports near the top.
-                # (
-                #     "daily_email_automation_second",
-                #     EMAIL_AUTOMATION_SECOND_SCHEDULE_HOUR,
-                #     EMAIL_AUTOMATION_SECOND_SCHEDULE_MINUTE,
-                # ),
+                (
+                    "daily_email_automation_second",
+                    EMAIL_AUTOMATION_SECOND_SCHEDULE_HOUR,
+                    EMAIL_AUTOMATION_SECOND_SCHEDULE_MINUTE,
+                ),
             )
             for job_id, hour, minute in email_schedules:
                 email_next_run = scheduler.get_job(job_id).next_run_time
