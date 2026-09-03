@@ -20,7 +20,7 @@ class FakeScheduler:
 
 
 class EmailScheduleTests(unittest.TestCase):
-    def test_registers_morning_and_second_email_jobs(self):
+    def test_registers_only_the_morning_email_job(self):
         scheduler = FakeScheduler()
         timezone = pytz.timezone("Europe/Berlin")
 
@@ -28,20 +28,14 @@ class EmailScheduleTests(unittest.TestCase):
 
         self.assertEqual(
             set(scheduler.jobs),
-            {"daily_email_automation", "daily_email_automation_second"},
+            {"daily_email_automation"},
         )
         morning = scheduler.jobs["daily_email_automation"]
-        second = scheduler.jobs["daily_email_automation_second"]
         self.assertIs(morning["function"], _scheduled_email_automation_job)
-        self.assertIs(second["function"], _scheduled_email_automation_job)
         self.assertEqual(str(morning["trigger"].fields[5]), "5")
         self.assertEqual(str(morning["trigger"].fields[6]), "0")
-        self.assertEqual(str(second["trigger"].fields[5]), "12")
-        self.assertEqual(str(second["trigger"].fields[6]), "30")
         self.assertEqual(str(morning["trigger"].timezone), "Europe/Berlin")
-        self.assertEqual(str(second["trigger"].timezone), "Europe/Berlin")
         self.assertEqual(morning["max_instances"], 1)
-        self.assertEqual(second["max_instances"], 1)
 
     def test_schedule_value_must_be_an_integer(self):
         with patch.dict(os.environ, {"TEST_SCHEDULE_VALUE": "noon"}):
