@@ -27,6 +27,7 @@ def handle_pdf_attachment(
     pcloud_client,
     history,
     logger: logging.Logger,
+    filename_context: str = "",
 ) -> AttachmentResult:
     """Upload one PDF idempotently and return its cloud status."""
     if b"%PDF-" not in payload[:1024]:
@@ -44,7 +45,11 @@ def handle_pdf_attachment(
 
     safe_original = safe_cloud_name(Path(original_name).name, "attachment.pdf")
     date_prefix = received_at.strftime("%Y-%m-%d")
-    cloud_filename = f"{date_prefix}_{sha256[:12]}_{safe_original}"
+    safe_context = safe_cloud_name(filename_context, "") if filename_context else ""
+    context_prefix = f"{safe_context}_" if safe_context else ""
+    cloud_filename = (
+        f"{date_prefix}_{context_prefix}{sha256[:12]}_{safe_original}"
+    )
 
     with TemporaryDirectory(prefix="email_automation_") as temporary_directory:
         temporary_path = Path(temporary_directory) / safe_original

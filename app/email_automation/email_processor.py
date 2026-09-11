@@ -9,6 +9,9 @@ from email.utils import parseaddr, parsedate_to_datetime
 from app.email_automation.attachment_handler import handle_pdf_attachment
 
 
+UNKNOWN_SUPPLIERS_FOLDER = "Unknown Suppliers"
+
+
 def _received_datetime(message) -> datetime:
     try:
         value = parsedate_to_datetime(message.get("Date", ""))
@@ -83,9 +86,12 @@ def process_emails(
                 domain = sender_email.rsplit("@", 1)[-1] if "@" in sender_email else ""
                 supplier_name = domain_map.get(domain)
             if not supplier_name:
-                logger.warning("  No supplier match for '%s'; leaving email unseen", sender_email)
-                stats["skipped_no_supplier"] += 1
-                continue
+                supplier_name = UNKNOWN_SUPPLIERS_FOLDER
+                logger.warning(
+                    "  No supplier match for '%s'; using fallback folder '%s'",
+                    sender_email,
+                    supplier_name,
+                )
 
             attachments = list(_pdf_attachments(message))
             if not attachments:
@@ -108,6 +114,11 @@ def process_emails(
                     pcloud_client=pcloud_client,
                     history=history,
                     logger=logger,
+                    filename_context=(
+                        sender_email
+                        if supplier_name == UNKNOWN_SUPPLIERS_FOLDER
+                        else ""
+                    ),
                 )
                 if result.status == "uploaded":
                     stats["pdfs_uploaded"] += 1

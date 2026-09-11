@@ -431,18 +431,36 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(len(retry_cloud.calls), 1)
         self.assertEqual(retry_imap.seen, ["9"])
 
-    def test_unmatched_supplier_remains_unseen(self):
-        imap = FakeImap({"10": make_email(sender="unknown@example.test")})
+    def test_unmatched_supplier_uses_identifiable_unknown_folder_filename(self):
+        imap = FakeImap({"10": make_email(sender="orders@hifi-filter.com")})
+        pcloud = FakePCloud()
         stats = process_emails(
             imap,
             {},
             {},
-            FakePCloud(),
+            pcloud,
             self.history,
             self.logger,
         )
-        self.assertEqual(stats["skipped_no_supplier"], 1)
-        self.assertEqual(imap.seen, [])
+        self.assertEqual(stats["skipped_no_supplier"], 0)
+        self.assertEqual(stats["pdfs_uploaded"], 1)
+        self.assertEqual(pcloud.calls[0][0], "Unknown Suppliers")
+        self.assertTrue(
+            pcloud.calls[0][1].startswith("2026-08-24_orders@hifi-filter.com_")
+        )
+        self.assertTrue(pcloud.calls[0][1].endswith("_order.pdf"))
+        self.assertEqual(imap.seen, ["10"])
+
+    def test_unknown_supplier_filename_identifies_sender(self):
+        imap = FakeImap({"10": make_email(sender="veronika.gerber@aro.ch")})
+        pcloud = FakePCloud()
+
+        stats = process_emails(imap, {}, {}, pcloud, self.history, self.logger)
+
+        self.assertEqual(stats["pdfs_uploaded"], 1)
+        self.assertEqual(pcloud.calls[0][0], "Unknown Suppliers")
+        self.assertIn("veronika.gerber@aro.ch", pcloud.calls[0][1])
+        self.assertEqual(imap.seen, ["10"])
 
     def test_pcloud_upload_uses_nopartial_without_rename(self):
         pdf = Path(self.temporary_directory.name) / "test.pdf"

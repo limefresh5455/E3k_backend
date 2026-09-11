@@ -2,7 +2,11 @@ import importlib
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from app.services.erp_service import _update_article_sales_prices, push_to_erp
+from app.services.erp_service import (
+    _update_article_sales_prices,
+    _update_voucher_line,
+    push_to_erp,
+)
 from app.services.extraction_service import (
     _apply_mcc_table_validation,
     _calculate_mcc_sales_prices,
@@ -70,6 +74,13 @@ class MccSalesPriceCalculationTests(unittest.TestCase):
         self.assertAlmostEqual(result["purchase_net_price"], 2.943)
         self.assertEqual(result["sales_price_net"], 11.8)
         self.assertEqual(result["sales_price_gross"], 12.8)
+
+    def test_matches_client_ssbv400_example(self):
+        result = _calculate_mcc_sales_prices(828.99, 373.05, 55.0)
+
+        self.assertAlmostEqual(result["purchase_net_price"], 373.0455)
+        self.assertEqual(result["sales_price_net"], 1492.2)
+        self.assertEqual(result["sales_price_gross"], 1613.1)
 
     def test_validates_pdf_total_from_exact_discounted_price(self):
         self.assertTrue(_mcc_line_total_matches(2, 2.943, 5.89))
@@ -216,6 +227,55 @@ class ErpArticleSalesPriceTests(unittest.TestCase):
             )
 
 
+class ErpVoucherLineSalesPriceTests(unittest.TestCase):
+    @patch("app.services.erp_service._erp_request")
+    def test_adds_mcc_net_sales_price_without_changing_existing_fields(self, request_mock):
+        response = Mock(ok=True)
+        response.json.return_value = "47840"
+        request_mock.return_value = response
+
+        result = _update_voucher_line(
+            voucher_number_b="B2601298",
+            erp_article_number="125011",
+            delivery_date="2026-09-04 00:00:00.000",
+            unit_price=828.99,
+            line_total=373.05,
+            discount_percent=55.0,
+            sales_price_net=1492.2,
+        )
+
+        self.assertEqual(result, "47840")
+        self.assertEqual(
+            request_mock.call_args.kwargs["json"],
+            {
+                "F002": "B2601298",
+                "F003": "125011",
+                "F016": "828.99",
+                "F017": "55.00",
+                "F018": "373.05",
+                "F035": "2026-09-04 00:00:00.000",
+                "F070": "1492.20",
+            },
+        )
+
+    @patch("app.services.erp_service._erp_request")
+    def test_omits_sales_price_field_when_not_supplied(self, request_mock):
+        response = Mock(ok=True)
+        response.json.return_value = "11"
+        request_mock.return_value = response
+
+        _update_voucher_line(
+            voucher_number_b="B2601001",
+            erp_article_number="ERP-100",
+            delivery_date=None,
+            unit_price=10.0,
+            line_total=9.0,
+            discount_percent=55.0,
+        )
+
+        self.assertNotIn("F070", request_mock.call_args.kwargs["json"])
+
+
 class ErpMccSalesPriceFlowTests(unittest.TestCase):
     def _extracted(self, *, is_mcc=True, include_prices=True):
         line = {
@@ -239,7 +299,7 @@ class ErpMccSalesPriceFlowTests(unittest.TestCase):
     @patch("app.services.erp_service._pick_best_erp_line")
     @patch("app.services.erp_service._get_purchase_order_lines")
     def test_mcc_flow_updates_matched_article_prices(
-        self, get_lines_mock, pick_line_mock, _voucher_update_mock, article_update_mock
+        self, get_lines_mock, pick_line_mock, voucher_update_mock, article_update_mock
     ):
         erp_line = {
             "Id": 7,
@@ -261,6 +321,7 @@ class ErpMccSalesPriceFlowTests(unittest.TestCase):
             sales_price_net=18.0,
             sales_price_gross=19.5,
         )
+        self.assertEqual(voucher_update_mock.call_args.kwargs["sales_price_net"], 18.0)
         self.assertEqual(
             result["payload_sent"]["mcc_sales_price_updates"]["ERP-100"]["erp_record_id"],
             "99",
@@ -271,7 +332,7 @@ class ErpMccSalesPriceFlowTests(unittest.TestCase):
     @patch("app.services.erp_service._pick_best_erp_line")
     @patch("app.services.erp_service._get_purchase_order_lines")
     def test_non_mcc_flow_never_updates_article_prices(
-        self, get_lines_mock, pick_line_mock, _voucher_update_mock, article_update_mock
+        self, get_lines_mock, pick_line_mock, voucher_update_mock, article_update_mock
     ):
         erp_line = {
             "Id": 7,
@@ -286,13 +347,14 @@ class ErpMccSalesPriceFlowTests(unittest.TestCase):
         push_to_erp(self._extracted(is_mcc=False))
 
         article_update_mock.assert_not_called()
+        self.assertIsNone(voucher_update_mock.call_args.kwargs["sales_price_net"])
 
     @patch("app.services.erp_service._update_article_sales_prices")
     @patch("app.services.erp_service._update_voucher_line", return_value="11")
     @patch("app.services.erp_service._pick_best_erp_line")
     @patch("app.services.erp_service._get_purchase_order_lines")
     def test_mcc_freight_line_does_not_update_article_sales_prices(
-        self, get_lines_mock, pick_line_mock, _voucher_update_mock, article_update_mock
+        self, get_lines_mock, pick_line_mock, voucher_update_mock, article_update_mock
     ):
         erp_line = {
             "Id": 7,
@@ -311,6 +373,7 @@ class ErpMccSalesPriceFlowTests(unittest.TestCase):
         result = push_to_erp(extracted)
 
         article_update_mock.assert_not_called()
+        self.assertIsNone(voucher_update_mock.call_args.kwargs["sales_price_net"])
         alert_types = {
             alert["type"] for alert in result["payload_sent"].get("alerts", [])
         }

@@ -575,18 +575,24 @@ def _update_voucher_line(
     unit_price: float,
     line_total: float,
     discount_percent: Optional[float] = None,
+    sales_price_net: Optional[float] = None,
 ) -> str:
     payload = {
         "F002": voucher_number_b,
         "F003": erp_article_number,
         "F016": f"{_truncate_decimals(unit_price, 2):.2f}",
         "F018": f"{line_total:.2f}",
-        # "F070": f"{unit_price:.2f}",
     }
     if discount_percent is not None:
         payload["F017"] = f"{_as_float(discount_percent):.2f}"
     if delivery_date:
         payload["F035"] = delivery_date
+    if sales_price_net is not None:
+        sales_price_net_f = _as_float(sales_price_net, default=0.0)
+        if sales_price_net_f <= 0:
+            raise ValueError("MCC sales_price_net must be greater than zero.")
+        # F070 is the purchase-order line's "VP netto in Artikel" snapshot.
+        payload["F070"] = f"{sales_price_net_f:.2f}"
 
     logger.info("ERP VoucherLine update payload: %s", payload)
 
@@ -929,6 +935,16 @@ def push_to_erp(extracted: dict) -> dict:
                 }
             )
 
+        mcc_sales_price_net = pdf_line.get("MccSalesPriceNet")
+        mcc_sales_price_gross = pdf_line.get("MccSalesPriceGross")
+        mcc_sales_price_excluded = bool(pdf_line.get("MccSalesPriceExcluded"))
+        has_valid_mcc_sales_prices = ( 
+            is_mcc_order
+            and not mcc_sales_price_excluded
+            and mcc_sales_price_net is not None
+            and mcc_sales_price_gross is not None
+        )
+
         updated_id = _update_voucher_line(
             voucher_number_b=voucher_number_b,
             erp_article_number=erp_article_number,
@@ -936,12 +952,10 @@ def push_to_erp(extracted: dict) -> dict:
             unit_price=unit_price,
             line_total=line_total,
             discount_percent=pdf_line.get("DiscountPercent"),
+            sales_price_net=(mcc_sales_price_net if has_valid_mcc_sales_prices else None),
         )
         updated_ids.append(updated_id)
         updated_pdf_numbers.append(pdf_num)
-        mcc_sales_price_net = pdf_line.get("MccSalesPriceNet")
-        mcc_sales_price_gross = pdf_line.get("MccSalesPriceGross")
-        mcc_sales_price_excluded = bool(pdf_line.get("MccSalesPriceExcluded"))
         if pdf_line.get("MccDiscountDiffersFromDefault"):
             mcc_discount_alert_lines.append(
                 {
@@ -950,12 +964,7 @@ def push_to_erp(extracted: dict) -> dict:
                     "default_discount_percent": 55.0,
                 }
             )
-        if (
-            is_mcc_order
-            and not mcc_sales_price_excluded
-            and mcc_sales_price_net is not None
-            and mcc_sales_price_gross is not None
-        ):
+        if has_valid_mcc_sales_prices:
             proposed_prices = {
                 "net": round(_as_float(mcc_sales_price_net), 2),
                 "gross": round(_as_float(mcc_sales_price_gross), 2),
