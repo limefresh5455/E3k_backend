@@ -702,6 +702,79 @@ def _update_article_sales_prices(
     return record_id
 
 
+def _update_article_sales_price_net(
+    *,
+    article_number: str,
+    sales_price_net: float,
+) -> str:
+    """Update only the net sales price (F032) on an ERP article."""
+    article_number = str(article_number or "").strip()
+    net = _as_float(sales_price_net, default=0.0)
+    if not article_number:
+        raise ValueError("ERP article number is required for the net sales-price update.")
+    if net <= 0:
+        raise ValueError(
+            f"Invalid net sales price for article '{article_number}': net={net}"
+        )
+
+    payload = {
+        "F001": article_number,
+        "F032": f"{net:.2f}",
+    }
+    logger.info("ERP Article net sales-price update payload: %s", payload)
+    response = _erp_request(
+        "PUT",
+        f"{ERP_BASE_URL}/api/Article/Update",
+        context=f"Article/Update net sales price (article={article_number})",
+        json=payload,
+        auth=_auth(),
+    )
+    if not response.ok:
+        raise Exception(
+            f"ERP Article net sales-price UPDATE failed ({response.status_code}) for article "
+            f"'{article_number}': {response.text[:1500]}"
+        )
+
+    body = response.json()
+    if isinstance(body, dict) and "Message" in body:
+        raise Exception(
+            f"ERP article net sales-price update error: {body.get('Message')} | "
+            f"{body.get('Errors', [])}"
+        )
+    record_id = str(body).strip()
+    if not record_id.isdigit() or int(record_id) <= 0:
+        raise Exception(
+            f"ERP returned an invalid net sales-price update result for article "
+            f"'{article_number}': {body!r}"
+        )
+
+    verify_response = _erp_request(
+        "POST",
+        f"{ERP_BASE_URL}/api/Article/Key/{quote(article_number, safe='')}",
+        context=f"Article/Key net sales-price verification (article={article_number})",
+        json=["F032"],
+        auth=_auth(),
+    )
+    if not verify_response.ok:
+        raise Exception(
+            f"ERP Article net sales-price verification failed ({verify_response.status_code}) "
+            f"for article '{article_number}': {verify_response.text[:1500]}"
+        )
+    saved = verify_response.json()
+    if not isinstance(saved, dict):
+        raise Exception(
+            f"ERP returned an invalid net sales-price verification result for article "
+            f"'{article_number}': {saved!r}"
+        )
+    saved_net = _as_float(saved.get("F032"), default=float("nan"))
+    if not math.isfinite(saved_net) or abs(saved_net - net) > 0.001:
+        raise Exception(
+            f"ERP net sales-price verification mismatch for article '{article_number}': "
+            f"expected F032={net:.2f}; received F032={saved.get('F032')!r}"
+        )
+    return record_id
+
+
 def push_manual_line_update(
     *,
     voucher_number: str,
@@ -822,6 +895,9 @@ def push_to_erp(extracted: dict) -> dict:
     calculated_total = 0.0
     updated_count = 0
     is_mcc_order = bool(extracted.get("IsMccOrderConfirmation"))
+    is_nilfisk_order = bool(
+        re.search(r"\bnilfisk\b", str(extracted.get("Supplier") or ""), re.IGNORECASE)
+    )
     has_surcharge_column = bool(extracted.get("HasSurchargeColumn"))
     order_date_dt = None
     order_date_raw = extracted.get("OrderDate") or extracted.get("VoucherDate")
@@ -944,6 +1020,14 @@ def push_to_erp(extracted: dict) -> dict:
             and mcc_sales_price_net is not None
             and mcc_sales_price_gross is not None
         )
+        nilfisk_sales_price_net = (
+            base_unit_price if is_nilfisk_order and base_unit_price > 0 else None
+        )
+        voucher_line_sales_price_net = (
+            mcc_sales_price_net
+            if has_valid_mcc_sales_prices
+            else nilfisk_sales_price_net
+        )
 
         updated_id = _update_voucher_line(
             voucher_number_b=voucher_number_b,
@@ -952,10 +1036,15 @@ def push_to_erp(extracted: dict) -> dict:
             unit_price=unit_price,
             line_total=line_total,
             discount_percent=pdf_line.get("DiscountPercent"),
-            sales_price_net=(mcc_sales_price_net if has_valid_mcc_sales_prices else None),
+            sales_price_net=voucher_line_sales_price_net,
         )
         updated_ids.append(updated_id)
         updated_pdf_numbers.append(pdf_num)
+        if nilfisk_sales_price_net is not None:
+            _update_article_sales_price_net(
+                article_number=erp_article_number,
+                sales_price_net=nilfisk_sales_price_net,
+            )
         if pdf_line.get("MccDiscountDiffersFromDefault"):
             mcc_discount_alert_lines.append(
                 {
