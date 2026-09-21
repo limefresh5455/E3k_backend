@@ -36,7 +36,7 @@ def _run_sync_job():
         with state_lock:
             sync_state["last_error"] = str(exc)
     finally:
-        with state_lock:
+        with state_lock:       
             sync_state["is_running"] = False
             sync_state["finished_at"] = datetime.now(timezone.utc).isoformat()
         logger.info("[JOB] ERP-WC sync finished at %s", sync_state["finished_at"])

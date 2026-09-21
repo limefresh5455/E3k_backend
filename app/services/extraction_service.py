@@ -1105,24 +1105,57 @@ def _apply_mcc_table_validation(pdf_text: str, pdf_bytes: bytes, extracted: dict
 
     extracted["IsMccOrderConfirmation"] = True
     parsed_rows = _extract_mcc_table_rows(pdf_bytes)
-    available_rows = list(parsed_rows)
+    voucher_lines = extracted.get("VoucherLines", [])
+    parsed_row_numbers = {
+        _normalized_article_number(row["number"])
+        for row in parsed_rows
+        if _normalized_article_number(row["number"])
+    }
+    used_line_indexes: set[int] = set()
+    duplicate_line_indexes: set[int] = set()
     corrected = 0
 
-    for line in extracted.get("VoucherLines", []):
-        line_number = _normalized_article_number(line.get("Number"))
-        if not line_number:
+    # Match from the authoritative physical PDF rows to extracted lines. Exact
+    # article-number matches must win over prefix matches: recovery can add the
+    # correct ``MMS1010F`` beside an LLM line such as ``MMS1010F SS``. The old
+    # line-first loop let the malformed prefix consume the only validated row.
+    for row in parsed_rows:
+        row_number = _normalized_article_number(row["number"])
+        if not row_number:
             continue
 
-        matched_index = None
-        for index, row in enumerate(available_rows):
-            row_number = _normalized_article_number(row["number"])
-            if row_number == line_number or row_number.startswith(line_number) or line_number.startswith(row_number):
-                matched_index = index
-                break
-        if matched_index is None:
+        exact_indexes = [
+            index
+            for index, line in enumerate(voucher_lines)
+            if index not in used_line_indexes
+            and _normalized_article_number(line.get("Number")) == row_number
+        ]
+        approximate_indexes = [
+            index
+            for index, line in enumerate(voucher_lines)
+            if index not in used_line_indexes
+            and (line_number := _normalized_article_number(line.get("Number")))
+            and line_number != row_number
+            and (row_number.startswith(line_number) or line_number.startswith(row_number))
+        ]
+
+        if exact_indexes:
+            matched_index = exact_indexes[0]
+            # Remove only malformed approximate variants which are not real
+            # physical article numbers elsewhere in this MCC table.
+            duplicate_line_indexes.update(
+                index
+                for index in approximate_indexes
+                if _normalized_article_number(voucher_lines[index].get("Number"))
+                not in parsed_row_numbers
+            )
+        elif approximate_indexes:
+            matched_index = approximate_indexes[0]
+        else:
             continue
 
-        row = available_rows.pop(matched_index)
+        used_line_indexes.add(matched_index)
+        line = voucher_lines[matched_index]
         replacements = {
             "Quantity": row["quantity"],
             "GrossPrice": row["gross_price"],
@@ -1143,6 +1176,18 @@ def _apply_mcc_table_validation(pdf_text: str, pdf_bytes: bytes, extracted: dict
         if any(line.get(key) != value for key, value in replacements.items()):
             corrected += 1
         line.update(replacements)
+
+    if duplicate_line_indexes:
+        extracted["VoucherLines"] = [
+            line
+            for index, line in enumerate(voucher_lines)
+            if index not in duplicate_line_indexes
+        ]
+        extracted["MccDuplicateLineCount"] = len(duplicate_line_indexes)
+        logger.warning(
+            "Removed %d malformed MCC duplicate line(s) after exact table matching.",
+            len(duplicate_line_indexes),
+        )
 
     extracted["MccValidatedLineCount"] = len(parsed_rows)
     extracted["MccCorrectedLineCount"] = corrected

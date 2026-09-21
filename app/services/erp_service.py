@@ -232,6 +232,28 @@ def _effective_line_total(pdf_line: dict, unit_price: float, has_surcharge_colum
     return base_total, 0.0
 
 
+NILFISK_LOW_PRICE_THRESHOLD = 50.0
+NILFISK_PRICE_ADDITION = 2.5
+NILFISK_PRICE_DIVISOR = 0.53
+
+
+def _calculate_nilfisk_sales_price(
+    published_price: float,
+    purchase_price: float,
+) -> float | None:
+    """Return Nilfisk's sales price, uplifting purchase prices below CHF 50."""
+    published_price = _as_float(published_price, default=0.0)
+    purchase_price = _as_float(purchase_price, default=0.0)
+    if published_price <= 0:
+        return None
+    if 0 < purchase_price < NILFISK_LOW_PRICE_THRESHOLD:
+        return round(
+            (purchase_price + NILFISK_PRICE_ADDITION) / NILFISK_PRICE_DIVISOR,
+            2,
+        )
+    return round(published_price, 2)
+
+
 def _unit_factor(pdf_line: dict) -> float:
     """
     Some suppliers quote a price per pack/base unit (e.g. Einheit=100),
@@ -1020,8 +1042,15 @@ def push_to_erp(extracted: dict) -> dict:
             and mcc_sales_price_net is not None
             and mcc_sales_price_gross is not None
         )
+        purchase_unit_price = (
+            round(line_total / qty_for_total, 4)
+            if qty_for_total > 0 and line_total > 0
+            else 0.0
+        )
         nilfisk_sales_price_net = (
-            base_unit_price if is_nilfisk_order and base_unit_price > 0 else None
+            _calculate_nilfisk_sales_price(base_unit_price, purchase_unit_price)
+            if is_nilfisk_order
+            else None
         )
         voucher_line_sales_price_net = (
             mcc_sales_price_net

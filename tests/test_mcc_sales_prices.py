@@ -93,6 +93,23 @@ class MccSalesPriceCalculationTests(unittest.TestCase):
 
 
 class MccValidatedLineTests(unittest.TestCase):
+    @staticmethod
+    def _mms1010_row():
+        return {
+            "number": "MMS1010F",
+            "quantity": 1.0,
+            "unit": "Stk",
+            "gross_price": 11.32,
+            "net_price": 5.09,
+            "discount_percent": 55.0,
+            "default_discount_applied": False,
+            "discount_differs_from_default": False,
+            "purchase_net_price": 5.094,
+            "sales_price_net": 20.4,
+            "sales_price_gross": 22.1,
+            "line_total": 5.09,
+        }
+
     @patch("app.services.extraction_service._extract_mcc_table_rows")
     def test_adds_sales_prices_only_to_verified_mcc_line(self, rows_mock):
         rows_mock.return_value = [
@@ -156,6 +173,52 @@ class MccValidatedLineTests(unittest.TestCase):
         self.assertTrue(line["MccSalesPriceExcluded"])
         self.assertNotIn("MccSalesPriceNet", line)
         self.assertNotIn("MccSalesPriceGross", line)
+
+    @patch("app.services.extraction_service._extract_mcc_table_rows")
+    def test_exact_recovered_line_wins_over_malformed_llm_prefix(self, rows_mock):
+        rows_mock.return_value = [self._mms1010_row()]
+        extracted = {
+            "VoucherLines": [
+                {
+                    "Number": "MMS1010F SS",
+                    "GrossPrice": 11.32,
+                    "DiscountPercent": 5.09,
+                    "LineTotal": 10.74,
+                },
+                {
+                    "Number": "MMS1010F",
+                    "GrossPrice": 11.32,
+                    "DiscountPercent": 5.09,
+                    "LineTotal": 10.74,
+                },
+            ]
+        }
+
+        result = _apply_mcc_table_validation(MCC_TEXT, b"pdf", extracted)
+
+        self.assertEqual(len(result["VoucherLines"]), 1)
+        line = result["VoucherLines"][0]
+        self.assertEqual(line["Number"], "MMS1010F")
+        self.assertEqual(line["GrossPrice"], 11.32)
+        self.assertEqual(line["DiscountPercent"], 55.0)
+        self.assertEqual(line["LineTotal"], 5.09)
+        self.assertEqual(result["MccDuplicateLineCount"], 1)
+
+    @patch("app.services.extraction_service._extract_mcc_table_rows")
+    def test_does_not_remove_a_prefix_that_is_another_physical_article(self, rows_mock):
+        short_row = self._mms1010_row()
+        short_row["number"] = "ABC"
+        long_row = dict(short_row, number="ABC1")
+        rows_mock.return_value = [short_row, long_row]
+        extracted = {"VoucherLines": [{"Number": "ABC"}, {"Number": "ABC1"}]}
+
+        result = _apply_mcc_table_validation(MCC_TEXT, b"pdf", extracted)
+
+        self.assertEqual(
+            [line["Number"] for line in result["VoucherLines"]],
+            ["ABC", "ABC1"],
+        )
+        self.assertNotIn("MccDuplicateLineCount", result)
 
 
 class ErpArticleSalesPriceTests(unittest.TestCase):
