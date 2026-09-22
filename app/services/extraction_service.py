@@ -157,6 +157,10 @@ _GENERIC_NON_SUPPLIER_PARTS = (
     "ihren",
 )
 
+_SUPPLIER_BY_CUSTOMER_NUMBER = {
+    "35228": "Cleanfix Reinigungssysteme AG",
+}
+
 SYSTEM_PROMPT = """You are a precise data extraction assistant for a Swiss hose service company (Schlauchservice Baumann GmbH).
 You receive raw text extracted from supplier order confirmation PDFs (in German) and must extract structured order data.
 
@@ -279,6 +283,30 @@ def _sanitize(extracted: dict) -> dict:
         line["Description"] = clean(line.get("Description"))
         line["DeliveryDate"] = clean(line.get("DeliveryDate"))
 
+    return extracted
+
+
+def _apply_customer_number_supplier_override(extracted: dict) -> dict:
+    """Resolve suppliers whose customer number uniquely identifies them."""
+    customer_number = re.sub(
+        r"[\s'’]",
+        "",
+        str(extracted.get("CustomerNumber") or "").strip(),
+    )
+    supplier = _SUPPLIER_BY_CUSTOMER_NUMBER.get(customer_number)
+    if not supplier:
+        return extracted
+
+    previous_supplier = extracted.get("Supplier")
+    extracted["Supplier"] = supplier
+    if previous_supplier != supplier:
+        logger.info(
+            "Supplier resolved from customer number: customer_number=%s, "
+            "supplier=%s, previous_supplier=%s",
+            customer_number,
+            supplier,
+            previous_supplier,
+        )
     return extracted
 
 
@@ -623,6 +651,7 @@ def llm_extract(pdf_text: str) -> dict:
         extracted = _parse_json_strict_or_salvage(raw_retry)
 
     extracted = _sanitize(extracted)
+    extracted = _apply_customer_number_supplier_override(extracted)
 
     supplier_val = extracted.get("Supplier")
     if _is_unreliable_supplier(supplier_val):

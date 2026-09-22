@@ -3,6 +3,7 @@ import logging
 import math
 import re
 import time
+import unicodedata
 from typing import Optional
 from urllib.parse import quote
 
@@ -232,23 +233,34 @@ def _effective_line_total(pdf_line: dict, unit_price: float, has_surcharge_colum
     return base_total, 0.0
 
 
-NILFISK_LOW_PRICE_THRESHOLD = 50.0
-NILFISK_PRICE_ADDITION = 2.5
-NILFISK_PRICE_DIVISOR = 0.53
+LOW_PRICE_SALES_THRESHOLD = 50.0
+LOW_PRICE_SALES_ADDITION = 2.5
+LOW_PRICE_SALES_DIVISOR = 0.53
+LOW_PRICE_SALES_SUPPLIERS = ("nilfisk", "kranzle", "kraenzle", "cleanfix")
 
 
-def _calculate_nilfisk_sales_price(
+def _uses_low_price_sales_rule(supplier: object) -> bool:
+    normalized = unicodedata.normalize("NFKD", str(supplier or ""))
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    normalized = normalized.casefold()
+    return any(
+        re.search(rf"\b{re.escape(name)}\b", normalized)
+        for name in LOW_PRICE_SALES_SUPPLIERS
+    )
+
+
+def _calculate_low_price_sales_price(
     published_price: float,
     purchase_price: float,
 ) -> float | None:
-    """Return Nilfisk's sales price, uplifting purchase prices below CHF 50."""
+    """Apply the selected suppliers' sales-price rule below CHF 50."""
     published_price = _as_float(published_price, default=0.0)
     purchase_price = _as_float(purchase_price, default=0.0)
     if published_price <= 0:
         return None
-    if 0 < purchase_price < NILFISK_LOW_PRICE_THRESHOLD:
+    if 0 < purchase_price < LOW_PRICE_SALES_THRESHOLD:
         return round(
-            (purchase_price + NILFISK_PRICE_ADDITION) / NILFISK_PRICE_DIVISOR,
+            (purchase_price + LOW_PRICE_SALES_ADDITION) / LOW_PRICE_SALES_DIVISOR,
             2,
         )
     return round(published_price, 2)
@@ -917,9 +929,7 @@ def push_to_erp(extracted: dict) -> dict:
     calculated_total = 0.0
     updated_count = 0
     is_mcc_order = bool(extracted.get("IsMccOrderConfirmation"))
-    is_nilfisk_order = bool(
-        re.search(r"\bnilfisk\b", str(extracted.get("Supplier") or ""), re.IGNORECASE)
-    )
+    uses_low_price_sales_rule = _uses_low_price_sales_rule(extracted.get("Supplier"))
     has_surcharge_column = bool(extracted.get("HasSurchargeColumn"))
     order_date_dt = None
     order_date_raw = extracted.get("OrderDate") or extracted.get("VoucherDate")
@@ -1042,20 +1052,35 @@ def push_to_erp(extracted: dict) -> dict:
             and mcc_sales_price_net is not None
             and mcc_sales_price_gross is not None
         )
+        # The purchase total originates in the PDF, so prefer its quantity for
+        # the per-unit sales-price calculation. ERP quantity remains the
+        # fallback when the PDF quantity is unavailable.
+        purchase_quantity = (
+            extracted_quantity if extracted_quantity > 0 else erp_quantity
+        )
+        purchase_line_total = line_total
+        if purchase_quantity > 0 and purchase_quantity != qty_for_total:
+            pdf_line_for_purchase = dict(pdf_line)
+            pdf_line_for_purchase["Quantity"] = purchase_quantity
+            purchase_line_total, _ = _effective_line_total(
+                pdf_line_for_purchase,
+                base_unit_price,
+                has_surcharge_column=has_surcharge_column,
+            )
         purchase_unit_price = (
-            round(line_total / qty_for_total, 4)
-            if qty_for_total > 0 and line_total > 0
+            round(purchase_line_total / purchase_quantity, 4)
+            if purchase_quantity > 0 and purchase_line_total > 0
             else 0.0
         )
-        nilfisk_sales_price_net = (
-            _calculate_nilfisk_sales_price(base_unit_price, purchase_unit_price)
-            if is_nilfisk_order
+        supplier_sales_price_net = (
+            _calculate_low_price_sales_price(base_unit_price, purchase_unit_price)
+            if uses_low_price_sales_rule
             else None
         )
         voucher_line_sales_price_net = (
             mcc_sales_price_net
             if has_valid_mcc_sales_prices
-            else nilfisk_sales_price_net
+            else supplier_sales_price_net
         )
 
         updated_id = _update_voucher_line(
@@ -1069,10 +1094,10 @@ def push_to_erp(extracted: dict) -> dict:
         )
         updated_ids.append(updated_id)
         updated_pdf_numbers.append(pdf_num)
-        if nilfisk_sales_price_net is not None:
+        if supplier_sales_price_net is not None:
             _update_article_sales_price_net(
                 article_number=erp_article_number,
-                sales_price_net=nilfisk_sales_price_net,
+                sales_price_net=supplier_sales_price_net,
             )
         if pdf_line.get("MccDiscountDiffersFromDefault"):
             mcc_discount_alert_lines.append(

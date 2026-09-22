@@ -2,21 +2,34 @@ import unittest
 from unittest.mock import Mock, patch
 
 from app.services.erp_service import (
-    _calculate_nilfisk_sales_price,
+    _calculate_low_price_sales_price,
     _update_article_sales_price_net,
+    _uses_low_price_sales_rule,
     push_to_erp,
 )
 
 
-class NilfiskSalesPriceCalculationTests(unittest.TestCase):
+class SupplierSalesPriceCalculationTests(unittest.TestCase):
     def test_uplifts_purchase_price_below_fifty_chf(self):
-        self.assertEqual(_calculate_nilfisk_sales_price(60.0, 20.0), 42.45)
+        self.assertEqual(_calculate_low_price_sales_price(60.0, 20.0), 42.45)
 
     def test_keeps_published_price_at_threshold(self):
-        self.assertEqual(_calculate_nilfisk_sales_price(65.0, 50.0), 65.0)
+        self.assertEqual(_calculate_low_price_sales_price(65.0, 50.0), 65.0)
 
     def test_keeps_published_price_above_threshold(self):
-        self.assertEqual(_calculate_nilfisk_sales_price(70.0, 50.01), 70.0)
+        self.assertEqual(_calculate_low_price_sales_price(70.0, 50.01), 70.0)
+
+    def test_recognizes_only_configured_suppliers(self):
+        suppliers = (
+            "Nilfisk AG",
+            "Kränzle AG",
+            "Kraenzle GmbH",
+            "Cleanfix Reinigungssysteme AG",
+        )
+        for supplier in suppliers:
+            with self.subTest(supplier=supplier):
+                self.assertTrue(_uses_low_price_sales_rule(supplier))
+        self.assertFalse(_uses_low_price_sales_rule("Other Supplier AG"))
 
 
 class ErpArticleNetSalesPriceTests(unittest.TestCase):
@@ -42,14 +55,14 @@ class ErpArticleNetSalesPriceTests(unittest.TestCase):
         self.assertEqual(request_mock.call_args_list[1].kwargs["json"], ["F032"])
 
 
-class NilfiskSalesPriceFlowTests(unittest.TestCase):
-    def _erp_line(self):
+class SupplierSalesPriceFlowTests(unittest.TestCase):
+    def _erp_line(self, quantity=1.0):
         return {
             "Id": 7,
             "LineFlag": 1,
             "ArticleNumber": "ERP-100",
             "VoucherAddress": "NILFISK",
-            "Quantity": 1.0,
+            "Quantity": quantity,
         }
 
     def _extracted(self, supplier="Nilfisk AG"):
@@ -93,11 +106,58 @@ class NilfiskSalesPriceFlowTests(unittest.TestCase):
             sales_price_net=33.47,
         )
 
+    @patch("app.services.erp_service._update_article_sales_price_net", return_value="99")
+    @patch("app.services.erp_service._update_voucher_line", return_value="11")
+    @patch("app.services.erp_service._pick_best_erp_line")
+    @patch("app.services.erp_service._get_purchase_order_lines")
+    def test_kranzle_and_cleanfix_use_same_sales_price_rule(
+        self,
+        get_lines_mock,
+        pick_line_mock,
+        voucher_update_mock,
+        article_update_mock,
+    ):
+        erp_line = self._erp_line()
+        get_lines_mock.return_value = [erp_line]
+        pick_line_mock.return_value = erp_line
+
+        for supplier in ("Kränzle AG", "Kraenzle GmbH", "Cleanfix AG"):
+            with self.subTest(supplier=supplier):
+                push_to_erp(self._extracted(supplier=supplier))
+                self.assertEqual(
+                    voucher_update_mock.call_args.kwargs["sales_price_net"],
+                    33.47,
+                )
+                self.assertEqual(
+                    article_update_mock.call_args.kwargs["sales_price_net"],
+                    33.47,
+                )
+
+    @patch("app.services.erp_service._update_article_sales_price_net", return_value="99")
+    @patch("app.services.erp_service._update_voucher_line", return_value="11")
+    @patch("app.services.erp_service._pick_best_erp_line")
+    @patch("app.services.erp_service._get_purchase_order_lines")
+    def test_purchase_price_uses_pdf_quantity_when_erp_quantity_differs(
+        self, get_lines_mock, pick_line_mock, voucher_update_mock, article_update_mock
+    ):
+        erp_line = self._erp_line(quantity=1.0)
+        extracted = self._extracted(supplier="Cleanfix AG")
+        extracted["VoucherLines"][0].update({"Quantity": 2.0, "LineTotal": 30.48})
+        get_lines_mock.return_value = [erp_line]
+        pick_line_mock.return_value = erp_line
+
+        push_to_erp(extracted)
+
+        self.assertEqual(voucher_update_mock.call_args.kwargs["sales_price_net"], 33.47)
+        article_update_mock.assert_called_once_with(
+            article_number="ERP-100", sales_price_net=33.47
+        )
+
     @patch("app.services.erp_service._update_article_sales_price_net")
     @patch("app.services.erp_service._update_voucher_line", return_value="11")
     @patch("app.services.erp_service._pick_best_erp_line")
     @patch("app.services.erp_service._get_purchase_order_lines")
-    def test_other_supplier_does_not_use_nilfisk_rule(
+    def test_other_supplier_does_not_use_shared_rule(
         self,
         get_lines_mock,
         pick_line_mock,
