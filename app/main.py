@@ -43,6 +43,8 @@ SCHEDULE_HOUR = 0
 SCHEDULE_MINUTE = 0
 SYNC_SCHEDULE_HOUR = 6
 SYNC_SCHEDULE_MINUTE = 15
+AFTERNOON_SYNC_SCHEDULE_HOUR = 13
+AFTERNOON_SYNC_SCHEDULE_MINUTE = 0
 
 
 def _scheduled_sync_job():
@@ -155,6 +157,18 @@ async def lifespan(app: FastAPI):
             misfire_grace_time=600,
             coalesce=True,
         )
+        scheduler.add_job(
+            _scheduled_sync_route_job,
+            trigger=CronTrigger(
+                hour=AFTERNOON_SYNC_SCHEDULE_HOUR,
+                minute=AFTERNOON_SYNC_SCHEDULE_MINUTE,
+                timezone=de,
+            ),
+            id="daily_sync_route_afternoon",
+            replace_existing=True,
+            misfire_grace_time=600,
+            coalesce=True,
+        )
         if EMAIL_AUTOMATION_ENABLED:
             _add_email_automation_jobs(scheduler, de)
         scheduler.start()
@@ -175,6 +189,17 @@ async def lifespan(app: FastAPI):
             SYNC_SCHEDULE_MINUTE,
             DE_TIMEZONE,
             sync_next_run.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        )
+
+        afternoon_sync_next_run = scheduler.get_job(
+            "daily_sync_route_afternoon"
+        ).next_run_time
+        logger.info(
+            "[SCHEDULER] Afternoon sync route scheduled at %02d:%02d (%s). Next run: %s",
+            AFTERNOON_SYNC_SCHEDULE_HOUR,
+            AFTERNOON_SYNC_SCHEDULE_MINUTE,
+            DE_TIMEZONE,
+            afternoon_sync_next_run.strftime("%Y-%m-%d %H:%M:%S %Z"),
         )
 
         if EMAIL_AUTOMATION_ENABLED:
