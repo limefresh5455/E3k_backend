@@ -17,7 +17,6 @@ from app.config import (
     EMAIL_AUTOMATION_SCHEDULE_MINUTE,
 )
 from app.db import init_db
-from app.services.erp_sync_job_service import trigger_sync
 from app.supplier_addresses.database import init_supplier_address_db
 
 try:
@@ -39,23 +38,10 @@ if not logging.getLogger().handlers:
 
 ENABLE_SCHEDULER = os.getenv("ENABLE_SCHEDULER", "true").lower() == "true"
 DE_TIMEZONE = "Europe/Berlin"
-SCHEDULE_HOUR = 0
-SCHEDULE_MINUTE = 0
 SYNC_SCHEDULE_HOUR = 6
 SYNC_SCHEDULE_MINUTE = 15
 AFTERNOON_SYNC_SCHEDULE_HOUR = 13
 AFTERNOON_SYNC_SCHEDULE_MINUTE = 0
-
-
-def _scheduled_sync_job():
-    result = trigger_sync()
-    if result.get("started"):
-        logger.info("[SCHEDULER] Nightly ERP-WC sync started.")
-    else:
-        logger.warning(
-            "[SCHEDULER] Nightly ERP-WC sync skipped (already running, started_at=%s).",
-            result.get("started_at"),
-        )
 
 
 def _scheduled_sync_route_job():
@@ -134,18 +120,6 @@ async def lifespan(app: FastAPI):
         de = pytz.timezone(DE_TIMEZONE)
         scheduler = BackgroundScheduler(timezone=de)
         scheduler.add_job(
-            _scheduled_sync_job,
-            trigger=CronTrigger(
-                hour=SCHEDULE_HOUR,
-                minute=SCHEDULE_MINUTE,
-                timezone=de,
-            ),
-            id="nightly_erp_wc_sync",
-            replace_existing=True,
-            misfire_grace_time=600,
-            coalesce=True,
-        )
-        scheduler.add_job(
             _scheduled_sync_route_job,
             trigger=CronTrigger(
                 hour=SYNC_SCHEDULE_HOUR,
@@ -172,15 +146,6 @@ async def lifespan(app: FastAPI):
         if EMAIL_AUTOMATION_ENABLED:
             _add_email_automation_jobs(scheduler, de)
         scheduler.start()
-
-        next_run = scheduler.get_job("nightly_erp_wc_sync").next_run_time
-        logger.info(
-            "[SCHEDULER] Nightly ERP-WC sync scheduled at %02d:%02d (%s). Next run: %s",
-            SCHEDULE_HOUR,
-            SCHEDULE_MINUTE,
-            DE_TIMEZONE,
-            next_run.strftime("%Y-%m-%d %H:%M:%S %Z"),
-        )
 
         sync_next_run = scheduler.get_job("daily_sync_route").next_run_time
         logger.info(
