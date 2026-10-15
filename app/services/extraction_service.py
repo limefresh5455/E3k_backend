@@ -923,6 +923,303 @@ def _preprocess_merged_positions(text: str) -> str:
     return pattern.sub(r"\1\2 \3", text)
 
 
+def _is_schwarz_stahl_order_confirmation(pdf_text: str) -> bool:
+    """Recognize Schwarz Stahl's multi-line order-confirmation table."""
+    normalized = re.sub(r"\s+", " ", pdf_text or "").casefold()
+    signatures = ("schwarz stahl ag", "netto-preis", "summe positionen")
+    return all(signature in normalized for signature in signatures)
+
+
+def _schwarz_number(value: str) -> float | None:
+    match = re.search(r"-?\d+(?:[.,]\d+)?", value or "")
+    if not match:
+        return None
+    return _as_float(match.group(0), default=0.0)
+
+
+def _schwarz_quantity_token(value: str) -> tuple[float, str | None] | None:
+    match = re.fullmatch(
+        r"\s*(\d+(?:[.,]\d+)?)\s*([A-Za-zÄÖÜäöü]+)?\s*",
+        value or "",
+    )
+    if not match:
+        return None
+    return _as_float(match.group(1)), (match.group(2) or None)
+
+
+def _parse_schwarz_stahl_page_words(words: list[dict]) -> list[dict]:
+    """Parse Schwarz Stahl rows from pdfplumber words using table columns."""
+    if not words:
+        return []
+
+    def text(word: dict) -> str:
+        return str(word.get("text") or "").strip()
+
+    def top(word: dict) -> float:
+        return float(word.get("top") or 0.0)
+
+    def x0(word: dict) -> float:
+        return float(word.get("x0") or 0.0)
+
+    headers: dict[str, dict] = {}
+    for word in words:
+        token = text(word).casefold()
+        if token in {"menge", "preis", "netto-preis", "betrag"} and token not in headers:
+            headers[token] = word
+    if set(headers) != {"menge", "preis", "netto-preis", "betrag"}:
+        return []
+
+    header_top = top(headers["menge"])
+    quantity_x = x0(headers["menge"])
+    gross_x = x0(headers["preis"])
+    net_x = x0(headers["netto-preis"])
+    amount_x = x0(headers["betrag"])
+    description_right = quantity_x - 15.0
+    quantity_right = (quantity_x + gross_x) / 2.0
+    gross_right = (gross_x + net_x) / 2.0
+    net_right = (net_x + amount_x) / 2.0
+
+    article_markers = sorted(
+        [
+            word
+            for word in words
+            if text(word).casefold() in {"art.", "art"} and top(word) > header_top
+        ],
+        key=lambda word: (top(word), x0(word)),
+    )
+    rows: list[dict] = []
+
+    for index, marker in enumerate(article_markers):
+        marker_top = top(marker)
+        next_marker_top = (
+            top(article_markers[index + 1])
+            if index + 1 < len(article_markers)
+            else float("inf")
+        )
+        baseline = [word for word in words if abs(top(word) - marker_top) <= 1.5]
+        article_candidates = [
+            word
+            for word in baseline
+            if x0(word) > x0(marker)
+            and x0(word) < description_right
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{3,}", text(word))
+        ]
+        if not article_candidates:
+            continue
+        article_number = text(sorted(article_candidates, key=x0)[0])
+
+        block = [word for word in words if marker_top < top(word) < next_marker_top]
+        discount_tops = [
+            top(word)
+            for word in block
+            if text(word).casefold().startswith("basisrabatt")
+        ]
+        content_end = min(discount_tops) if discount_tops else next_marker_top
+        content = [word for word in block if top(word) < content_end]
+
+        quantity_words = sorted(
+            [word for word in content if quantity_x <= x0(word) < quantity_right],
+            key=lambda word: (top(word), x0(word)),
+        )
+        quantities: list[tuple[float, str | None, float]] = []
+        for word_index, word in enumerate(quantity_words):
+            parsed = _schwarz_quantity_token(text(word))
+            if not parsed:
+                continue
+            quantity_value, quantity_unit = parsed
+            if quantity_unit is None:
+                same_line_units = [
+                    candidate
+                    for candidate in quantity_words[word_index + 1:]
+                    if abs(top(candidate) - top(word)) <= 1.5
+                    and re.fullmatch(r"[A-Za-zÄÖÜäöü]+", text(candidate))
+                ]
+                if same_line_units:
+                    quantity_unit = text(same_line_units[0])
+            quantities.append((quantity_value, quantity_unit, top(word)))
+        if not quantities:
+            continue
+
+        def first_number(left: float, right: float) -> float | None:
+            candidates = sorted(
+                [
+                    word
+                    for word in content
+                    if left <= x0(word) < right and "%" not in text(word)
+                ],
+                key=lambda word: (top(word), x0(word)),
+            )
+            for candidate in candidates:
+                value = _schwarz_number(text(candidate))
+                if value is not None:
+                    return value
+            return None
+
+        gross_price = first_number(quantity_right, gross_right)
+        printed_net_price = first_number(gross_right, net_right)
+        line_total = first_number(net_right, float("inf"))
+        if None in (gross_price, printed_net_price, line_total):
+            continue
+
+        net_words = sorted(
+            [word for word in content if gross_right <= x0(word) < net_right],
+            key=lambda word: (top(word), x0(word)),
+        )
+        pricing_unit = None
+        for net_index, word in enumerate(net_words):
+            token = text(word)
+            inline_unit = re.search(r"/\s*([A-Za-zÄÖÜäöü]+)", token)
+            if inline_unit:
+                pricing_unit = inline_unit.group(1)
+                break
+            if "/" in token:
+                following_units = [
+                    candidate
+                    for candidate in net_words[net_index + 1:]
+                    if abs(top(candidate) - top(word)) <= 1.5
+                    and re.fullmatch(r"[A-Za-zÄÖÜäöü]+", text(candidate))
+                ]
+                if following_units:
+                    pricing_unit = text(following_units[0])
+                    break
+
+        discount_percent = None
+        for word in block:
+            match = re.search(r"-?(\d+(?:[.,]\d+)?)\s*%", text(word))
+            if match:
+                discount_percent = abs(_as_float(match.group(1)))
+                break
+
+        ordered_quantity, ordered_unit, _ = quantities[0]
+        billing_quantity = ordered_quantity
+        billing_unit = pricing_unit or ordered_unit
+        if pricing_unit:
+            matching_billing_quantities = [
+                value
+                for value, unit, _ in quantities
+                if unit and unit.casefold() == pricing_unit.casefold()
+            ]
+            if matching_billing_quantities:
+                billing_quantity = matching_billing_quantities[-1]
+        conversion_factor = (
+            billing_quantity / ordered_quantity if ordered_quantity > 0 else 1.0
+        )
+
+        description_lines: dict[float, list[dict]] = {}
+        for word in content:
+            if x0(word) >= description_right:
+                continue
+            description_lines.setdefault(round(top(word), 1), []).append(word)
+        description = " ".join(
+            " ".join(text(word) for word in sorted(line_words, key=x0))
+            for _, line_words in sorted(description_lines.items())
+        ).strip()
+
+        rows.append(
+            {
+                "number": article_number,
+                "quantity": ordered_quantity,
+                "quantity_unit": ordered_unit,
+                "billing_quantity": billing_quantity,
+                "billing_unit": billing_unit,
+                "conversion_factor": conversion_factor,
+                "pricing_unit": pricing_unit,
+                "pricing_unit_factor": 1.0,
+                "gross_price": gross_price,
+                "printed_net_price": printed_net_price,
+                "discount_percent": discount_percent,
+                "line_total": line_total,
+                "description": description,
+            }
+        )
+
+    return rows
+
+
+def _extract_schwarz_stahl_table_rows(pdf_bytes: bytes) -> list[dict]:
+    rows: list[dict] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            rows.extend(_parse_schwarz_stahl_page_words(page.extract_words() or []))
+    return rows
+
+
+def _apply_schwarz_stahl_table_validation(
+    pdf_text: str,
+    pdf_bytes: bytes,
+    extracted: dict,
+) -> dict:
+    """Replace uncertain LLM rows with authoritative Schwarz Stahl table rows."""
+    if not _is_schwarz_stahl_order_confirmation(pdf_text):
+        return extracted
+
+    extracted["IsSchwarzStahlOrderConfirmation"] = True
+    parsed_rows = _extract_schwarz_stahl_table_rows(pdf_bytes)
+    physical_numbers = re.findall(
+        r"\bArt\.\s+([A-Za-z0-9][A-Za-z0-9._/-]{3,})",
+        pdf_text or "",
+        flags=re.IGNORECASE,
+    )
+    extracted["SchwarzStahlPhysicalLineCount"] = max(
+        len({_normalized_article_number(number) for number in physical_numbers}),
+        len(parsed_rows),
+    )
+    if not parsed_rows:
+        extracted["SchwarzStahlValidatedLineCount"] = 0
+        logger.warning("Schwarz Stahl layout detected, but no table rows were parsed.")
+        return extracted
+
+    existing_by_number = {
+        _normalized_article_number(line.get("Number")): line
+        for line in extracted.get("VoucherLines", [])
+        if _normalized_article_number(line.get("Number"))
+    }
+    validated_lines: list[dict] = []
+    for row in parsed_rows:
+        normalized_number = _normalized_article_number(row["number"])
+        line = dict(existing_by_number.get(normalized_number, {}))
+        line.update(
+            {
+                "$type": line.get(
+                    "$type",
+                    "E3k.Web.Objects.DataTransfer.VoucherLines.ArticleVoucherLine, E3k.Web.Objects.DataTransfer",
+                ),
+                "Number": row["number"],
+                "Quantity": row["quantity"],
+                # Dashboard conversion multiplier. PricingUnitFactor remains
+                # separate so ERP price logic never divides 59.50 by six.
+                "Einheit": row["conversion_factor"],
+                "PricingUnitFactor": row["pricing_unit_factor"],
+                "QuantityConversionFactor": row["conversion_factor"],
+                "QuantityUnit": row["quantity_unit"],
+                "BillingQuantity": row["billing_quantity"],
+                "BillingUnit": row["billing_unit"],
+                "PricingUnit": row["pricing_unit"],
+                "GrossPrice": row["gross_price"],
+                "PrintedNetPrice": row["printed_net_price"],
+                "LineTotal": row["line_total"],
+                "DiscountPercent": row["discount_percent"],
+                "Description": row["description"],
+                "DescriptionUnit": row["quantity_unit"],
+                "VatCode": "01",
+            }
+        )
+        validated_lines.append(line)
+
+    extracted["VoucherLines"] = validated_lines
+    extracted["SchwarzStahlValidatedLineCount"] = len(validated_lines)
+    extracted["SchwarzStahlPositionTotal"] = round(
+        sum(_as_float(line.get("LineTotal")) for line in validated_lines),
+        2,
+    )
+    logger.info(
+        "Schwarz Stahl table validation completed: validated=%d, position_total=%.2f",
+        len(validated_lines),
+        extracted["SchwarzStahlPositionTotal"],
+    )
+    return extracted
+
+
 def _is_mcc_order_confirmation(pdf_text: str) -> bool:
     """Recognize MCC's order-confirmation table without relying on supplier extraction."""
     normalized = re.sub(r"\s+", " ", pdf_text or "").casefold()
@@ -1243,12 +1540,18 @@ def extract_order_data(pdf_text: str, pdf_bytes: bytes) -> dict:
     )
     supplier_val = extracted.get("Supplier")
     extracted = _recover_missing_numbered_lines(pdf_text, extracted)
+    extracted = _apply_schwarz_stahl_table_validation(pdf_text, pdf_bytes, extracted)
     extracted = _apply_lt_delivery_weeks(pdf_text, extracted)
     extracted = _apply_delivery_date_fallbacks(pdf_text, extracted)
     extracted = _apply_mcc_table_validation(pdf_text, pdf_bytes, extracted)
     total_pdf, curr_pdf = _extract_total_from_last_pdf_page(pdf_bytes)
     if total_pdf is None:
         total_pdf, curr_pdf = _extract_total_from_pdf_text(pdf_text)
+    if extracted.get("SchwarzStahlPositionTotal") is not None:
+        # Article-less transport and VAT are intentionally excluded from
+        # VoucherLines, so validate against SUMME Positionen.
+        total_pdf = extracted["SchwarzStahlPositionTotal"]
+        curr_pdf = curr_pdf or "CHF"
     if total_pdf is not None:
         extracted["TotalNetFromPdf"] = total_pdf
     if curr_pdf and not extracted.get("Currency"):
@@ -1401,6 +1704,13 @@ def build_summary(data: dict, file_name: str, folder_name: str) -> dict:
                 "number": line.get("Number"),
                 "description": line.get("Description"),
                 "quantity": quantity,
+                "einheit": _as_float(
+                    line.get("QuantityConversionFactor", line.get("Einheit", 1)),
+                    default=1.0,
+                ),
+                "quantity_unit": line.get("QuantityUnit") or line.get("DescriptionUnit"),
+                "billing_quantity": line.get("BillingQuantity"),
+                "billing_unit": line.get("BillingUnit") or line.get("PricingUnit"),
                 "unit_price": round(unit_price, 2),
                 "discount_percent": discount_pct,
                 "line_total": line_total,

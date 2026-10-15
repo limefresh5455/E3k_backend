@@ -272,7 +272,8 @@ def _unit_factor(pdf_line: dict) -> float:
     while Quantity is in pack count. ERP expects price per single unit.
     """
     raw = (
-        pdf_line.get("Einheit")
+        pdf_line.get("PricingUnitFactor")
+        or pdf_line.get("Einheit")
         or pdf_line.get("UnitFactor")
         or pdf_line.get("PriceUnit")
         or pdf_line.get("UnitSize")
