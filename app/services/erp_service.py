@@ -1,4 +1,5 @@
 from datetime import datetime
+from decimal import Decimal, ROUND_CEILING
 import logging
 import math
 import re
@@ -253,17 +254,23 @@ def _calculate_low_price_sales_price(
     published_price: float,
     purchase_price: float,
 ) -> float | None:
-    """Apply the selected suppliers' sales-price rule below CHF 50."""
+    """Apply the selected suppliers' rule and round the result up to CHF 0.10."""
     published_price = _as_float(published_price, default=0.0)
     purchase_price = _as_float(purchase_price, default=0.0)
     if published_price <= 0:
         return None
     if 0 < purchase_price < LOW_PRICE_SALES_THRESHOLD:
-        return round(
-            (purchase_price + LOW_PRICE_SALES_ADDITION) / LOW_PRICE_SALES_DIVISOR,
-            2,
+        calculated_price = (
+            Decimal(str(purchase_price)) + Decimal(str(LOW_PRICE_SALES_ADDITION))
+        ) / Decimal(str(LOW_PRICE_SALES_DIVISOR))
+        return float(
+            calculated_price.quantize(Decimal("0.1"), rounding=ROUND_CEILING)
         )
-    return round(published_price, 2)
+    return float(
+        Decimal(str(published_price)).quantize(
+            Decimal("0.1"), rounding=ROUND_CEILING
+        )
+    )
 
 
 def _unit_factor(pdf_line: dict) -> float:

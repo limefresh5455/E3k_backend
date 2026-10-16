@@ -11,7 +11,13 @@ from app.services.erp_service import (
 
 class SupplierSalesPriceCalculationTests(unittest.TestCase):
     def test_uplifts_purchase_price_below_fifty_chf(self):
-        self.assertEqual(_calculate_low_price_sales_price(60.0, 20.0), 42.45)
+        self.assertEqual(_calculate_low_price_sales_price(60.0, 20.0), 42.5)
+
+    def test_rounds_published_price_up_to_ten_rappen(self):
+        self.assertEqual(_calculate_low_price_sales_price(432.12, 50.0), 432.2)
+
+    def test_keeps_price_already_on_ten_rappen_boundary(self):
+        self.assertEqual(_calculate_low_price_sales_price(432.10, 50.0), 432.1)
 
     def test_keeps_published_price_at_threshold(self):
         self.assertEqual(_calculate_low_price_sales_price(65.0, 50.0), 65.0)
@@ -100,10 +106,10 @@ class SupplierSalesPriceFlowTests(unittest.TestCase):
         self.assertEqual(voucher_update_mock.call_args.kwargs["unit_price"], 25.4)
         self.assertEqual(voucher_update_mock.call_args.kwargs["line_total"], 15.24)
         self.assertEqual(voucher_update_mock.call_args.kwargs["discount_percent"], 40.0)
-        self.assertEqual(voucher_update_mock.call_args.kwargs["sales_price_net"], 33.47)
+        self.assertEqual(voucher_update_mock.call_args.kwargs["sales_price_net"], 33.5)
         article_update_mock.assert_called_once_with(
             article_number="ERP-100",
-            sales_price_net=33.47,
+            sales_price_net=33.5,
         )
 
     @patch("app.services.erp_service._update_article_sales_price_net", return_value="99")
@@ -126,11 +132,11 @@ class SupplierSalesPriceFlowTests(unittest.TestCase):
                 push_to_erp(self._extracted(supplier=supplier))
                 self.assertEqual(
                     voucher_update_mock.call_args.kwargs["sales_price_net"],
-                    33.47,
+                    33.5,
                 )
                 self.assertEqual(
                     article_update_mock.call_args.kwargs["sales_price_net"],
-                    33.47,
+                    33.5,
                 )
 
     @patch("app.services.erp_service._update_article_sales_price_net", return_value="99")
@@ -148,9 +154,9 @@ class SupplierSalesPriceFlowTests(unittest.TestCase):
 
         push_to_erp(extracted)
 
-        self.assertEqual(voucher_update_mock.call_args.kwargs["sales_price_net"], 33.47)
+        self.assertEqual(voucher_update_mock.call_args.kwargs["sales_price_net"], 33.5)
         article_update_mock.assert_called_once_with(
-            article_number="ERP-100", sales_price_net=33.47
+            article_number="ERP-100", sales_price_net=33.5
         )
 
     @patch("app.services.erp_service._update_article_sales_price_net")
