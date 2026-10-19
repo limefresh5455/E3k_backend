@@ -8,6 +8,7 @@ requests
 psycopg2-binary
 PyJWT
 python-dotenv
+argon2-cffi
 
 pymupdf
 pytesseract 

@@ -10,6 +10,7 @@ from app.api import api_router
 from app.config import (
     API_TITLE,
     API_VERSION,
+    CORS_ALLOWED_ORIGINS,
     EMAIL_AUTOMATION_ENABLED,
     EMAIL_AUTOMATION_SECOND_SCHEDULE_HOUR,
     EMAIL_AUTOMATION_SECOND_SCHEDULE_MINUTE,
@@ -17,6 +18,7 @@ from app.config import (
     EMAIL_AUTOMATION_SCHEDULE_MINUTE,
 )
 from app.db import init_db
+from app.finance_auth.database import init_finance_auth_db
 from app.supplier_addresses.database import init_supplier_address_db
 
 try:
@@ -103,6 +105,7 @@ def _add_email_automation_jobs(scheduler, timezone):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    init_finance_auth_db()
     init_supplier_address_db()
     if EMAIL_AUTOMATION_ENABLED:
         from app.email_automation.database import init_email_automation_db
@@ -201,7 +204,7 @@ app = FastAPI(title=API_TITLE, version=API_VERSION, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

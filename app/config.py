@@ -30,6 +30,63 @@ JWT_EXPIRE_HOURS = 24
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin@123")
 
+# Finanz-Cockpit authentication is intentionally configured separately from the
+# legacy admin login above. Secrets have no insecure defaults; the Finanz auth
+# endpoints report a configuration error until production values are supplied.
+FINANCE_JWT_ACCESS_SECRET = os.getenv("FINANCE_JWT_ACCESS_SECRET", "")
+FINANCE_JWT_REFRESH_SECRET = os.getenv("FINANCE_JWT_REFRESH_SECRET", "")
+FINANCE_JWT_ALGORITHM = "HS256"
+FINANCE_JWT_ISSUER = os.getenv("FINANCE_JWT_ISSUER", "e3k-backend")
+FINANCE_JWT_AUDIENCE = os.getenv("FINANCE_JWT_AUDIENCE", "e3k-finanz-cockpit")
+FINANCE_ACCESS_TOKEN_MINUTES = _read_bounded_int(
+    "FINANCE_ACCESS_TOKEN_MINUTES", 15, 5, 60
+)
+FINANCE_REFRESH_TOKEN_DAYS = _read_bounded_int(
+    "FINANCE_REFRESH_TOKEN_DAYS", 7, 1, 30
+)
+FINANCE_RESET_TOKEN_MINUTES = _read_bounded_int(
+    "FINANCE_RESET_TOKEN_MINUTES", 10, 5, 30
+)
+FINANCE_OTP_PEPPER = os.getenv("FINANCE_OTP_PEPPER", "")
+FINANCE_OTP_EXPIRE_MINUTES = _read_bounded_int(
+    "FINANCE_OTP_EXPIRE_MINUTES", 5, 2, 15
+)
+FINANCE_OTP_MAX_ATTEMPTS = _read_bounded_int(
+    "FINANCE_OTP_MAX_ATTEMPTS", 5, 3, 10
+)
+FINANCE_OTP_RESEND_SECONDS = _read_bounded_int(
+    "FINANCE_OTP_RESEND_SECONDS", 60, 30, 300
+)
+FINANCE_OTP_MAX_REQUESTS_PER_HOUR = _read_bounded_int(
+    "FINANCE_OTP_MAX_REQUESTS_PER_HOUR", 5, 1, 20
+)
+FINANCE_LOGIN_MAX_ATTEMPTS = _read_bounded_int(
+    "FINANCE_LOGIN_MAX_ATTEMPTS", 5, 3, 20
+)
+FINANCE_LOGIN_LOCK_MINUTES = _read_bounded_int(
+    "FINANCE_LOGIN_LOCK_MINUTES", 15, 1, 120
+)
+FINANCE_REFRESH_COOKIE_NAME = os.getenv(
+    "FINANCE_REFRESH_COOKIE_NAME", "finance_refresh_token"
+)
+FINANCE_COOKIE_SECURE = os.getenv("FINANCE_COOKIE_SECURE", "true").lower() == "true"
+FINANCE_COOKIE_SAMESITE = os.getenv("FINANCE_COOKIE_SAMESITE", "lax").lower()
+CORS_ALLOWED_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = _read_bounded_int("SMTP_PORT", 587, 1, 65535)
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", "").strip()
+SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "E3k Finanz-Cockpit").strip()
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+SMTP_USE_SSL = os.getenv("SMTP_USE_SSL", "false").lower() == "true"
+SMTP_TIMEOUT_SECONDS = _read_bounded_int("SMTP_TIMEOUT_SECONDS", 15, 5, 60)
+
 LOCAL_PDF_MODE = os.getenv("LOCAL_PDF_MODE", "false").lower() == "true"
 LOCAL_PDF_FOLDER = os.getenv("LOCAL_PDF_FOLDER", "temp_pdfs")
 
