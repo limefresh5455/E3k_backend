@@ -8,7 +8,12 @@ from urllib.parse import urlsplit
 
 from app.db import get_conn
 from app.services.erp_service import push_to_erp
-from app.services.extraction_service import build_summary, extract_order_data, extract_text_from_bytes
+from app.services.extraction_service import (
+    build_summary,
+    extract_order_data,
+    extract_text_from_bytes,
+    split_mcc_combined_order_data,
+)
 from app.services.pcloud_service import (
     pcloud_download_pdf,
     pcloud_get_file_preview_url,
@@ -205,6 +210,126 @@ def _save_skipped(
 # Shared pipeline core
 # ---------------------------------------------------------------------------
 
+
+def _process_extracted_order(
+    *,
+    extracted: dict,
+    persistence_file_id: str,
+    file_name: str,
+    folder_name: str,
+    pdf_url: str,
+) -> dict:
+    """Run the unchanged ERP/save flow for one logical extracted order."""
+    order_number = str(extracted.get("OurOrderNumber", ""))
+    supplier = extracted.get("Supplier", "Unknown")
+    logger.info(
+        "Processing extracted order: file_name=%s, supplier=%s, order_number=%s, lines=%d",
+        file_name,
+        supplier,
+        order_number,
+        len(extracted.get("VoucherLines", [])),
+    )
+
+    erp_result = push_to_erp(extracted)
+    logger.info(
+        "ERP push succeeded for file_name=%s, supplier=%s, erp_record_id=%s, voucher_number=%s",
+        file_name,
+        supplier,
+        erp_result.get("erp_record_id"),
+        erp_result.get("voucher_number"),
+    )
+
+    updated_numbers = {
+        str(number).strip().upper()
+        for number in erp_result.get("payload_sent", {}).get("updated_pdf_numbers", [])
+        if number
+    }
+    updated_line_totals = (
+        erp_result.get("payload_sent", {}).get("updated_line_totals", {}) or {}
+    )
+    updated_line_quantities = (
+        erp_result.get("payload_sent", {}).get("updated_line_quantities", {}) or {}
+    )
+    updated_line_erp_article_numbers = (
+        erp_result.get("payload_sent", {}).get("updated_line_erp_article_numbers", {}) or {}
+    )
+    extracted_for_save = dict(extracted)
+    if updated_numbers:
+        filtered = []
+        for line in extracted.get("VoucherLines", []):
+            number = str(line.get("Number", "")).strip().upper()
+            if number not in updated_numbers:
+                continue
+            line_copy = dict(line)
+            if number in updated_line_totals:
+                line_copy["LineTotal"] = updated_line_totals[number]
+            if number in updated_line_quantities:
+                line_copy["Quantity"] = updated_line_quantities[number]
+            if number in updated_line_erp_article_numbers:
+                line_copy["ErpArticleNumber"] = updated_line_erp_article_numbers[number]
+            filtered.append(line_copy)
+        extracted_for_save["VoucherLines"] = filtered
+    else:
+        extracted_for_save["VoucherLines"] = extracted.get("VoucherLines", [])
+
+    summary = build_summary(extracted_for_save, file_name, folder_name)
+    erp_alerts = erp_result.get("payload_sent", {}).get("alerts", []) or []
+    summary["alerts"] = erp_alerts
+    summary["requires_double_check"] = bool(
+        erp_result.get("payload_sent", {}).get("requires_double_check")
+    )
+
+    attention_alert_types = {
+        "pdf_total_mismatch",
+        "fewer_lines_than_expected",
+        "mcc_discount_differs_from_default",
+        "mcc_sales_price_update_failed",
+        "mcc_sales_price_validation_failed",
+    }
+    attention_alerts = [
+        alert for alert in erp_alerts if alert.get("type") in attention_alert_types
+    ]
+    attention = bool(attention_alerts)
+    attention_reasons = [
+        alert.get("message", alert.get("type", "")) for alert in attention_alerts
+    ]
+    order_status = "attention" if attention else "success"
+
+    _save_success(
+        file_id=persistence_file_id,
+        file_name=file_name,
+        folder_name=folder_name,
+        pdf_url=pdf_url,
+        order_number=order_number,
+        supplier=supplier,
+        extracted=extracted_for_save,
+        summary=summary,
+        erp_record_id=erp_result.get("erp_record_id", ""),
+        erp_voucher_number=erp_result.get("voucher_number", ""),
+        erp_supplier_number=erp_result.get("supplier_number", ""),
+        erp_article_no=erp_result.get("erp_article_numbers", ""),
+        attention=attention,
+        attention_reasons=attention_reasons,
+        status=order_status,
+    )
+    retry_mcc_sales_prices = any(
+        alert.get("type") == "mcc_sales_price_update_failed"
+        for alert in erp_alerts
+    )
+    return {
+        "status": order_status,
+        "attention": attention,
+        "attention_reasons": attention_reasons,
+        "order_number": order_number,
+        "supplier": supplier,
+        "erp_record_id": erp_result.get("erp_record_id"),
+        "erp_voucher_number": erp_result.get("voucher_number"),
+        "erp_supplier_number": erp_result.get("supplier_number"),
+        "erp_article_no": erp_result.get("erp_article_numbers"),
+        "retry_required": retry_mcc_sales_prices,
+    }
+
+
 def _run_pipeline(
     pdf_bytes: bytes,
     file_id: str,
@@ -253,118 +378,99 @@ def _run_pipeline(
             raise ValueError("Es konnte kein Text extrahiert werden (bildbasiertes PDF?)")
         logger.info("Text extracted for file_name=%s, chars=%d", file_name, len(pdf_text))
 
-        # Step 2 - LLM extraction
+        # Step 2 - run the existing extraction once, then split only a strictly
+        # recognized combined MCC confirmation into logical purchase orders.
         extracted = extract_order_data(pdf_text, pdf_bytes)
-        order_number = str(extracted.get("OurOrderNumber", ""))
-        supplier = extracted.get("Supplier", "Unknown")
+        extracted_orders = split_mcc_combined_order_data(extracted)
         logger.info(
-            "LLM extraction completed for file_name=%s, supplier=%s, order_number=%s, lines=%d",
+            "Extraction completed for file_name=%s, supplier=%s, logical_orders=%s, lines=%d",
             file_name,
-            supplier,
-            order_number,
+            extracted.get("Supplier", "Unknown"),
+            [order.get("OurOrderNumber") for order in extracted_orders],
             len(extracted.get("VoucherLines", [])),
         )
-        # Step 3 - push to ERP
-        erp_result = push_to_erp(extracted)
-        logger.info(
-            "ERP push succeeded for file_name=%s, supplier=%s, erp_record_id=%s, voucher_number=%s",
-            file_name,
-            supplier,
-            erp_result.get("erp_record_id"),
-            erp_result.get("voucher_number"),
-        )
 
-        updated_numbers = {
-            str(n).strip().upper()
-            for n in erp_result.get("payload_sent", {}).get("updated_pdf_numbers", [])
-            if n
-        }
-        updated_line_totals = erp_result.get("payload_sent", {}).get("updated_line_totals", {}) or {}
-        updated_line_quantities = erp_result.get("payload_sent", {}).get("updated_line_quantities", {}) or {}
-        updated_line_erp_article_numbers = (
-            erp_result.get("payload_sent", {}).get("updated_line_erp_article_numbers", {}) or {}
-        )
-        extracted_for_save = dict(extracted)
-        if updated_numbers:
-            filtered = []
-            for ln in extracted.get("VoucherLines", []):
-                num = str(ln.get("Number", "")).strip().upper()
-                if num in updated_numbers:
-                    ln_copy = dict(ln)
-                    if num in updated_line_totals:
-                        ln_copy["LineTotal"] = updated_line_totals[num]
-                    if num in updated_line_quantities:
-                        ln_copy["Quantity"] = updated_line_quantities[num]
-                    if num in updated_line_erp_article_numbers:
-                        ln_copy["ErpArticleNumber"] = updated_line_erp_article_numbers[num]
-                    filtered.append(ln_copy)
-            extracted_for_save["VoucherLines"] = filtered
-        else:
-            extracted_for_save["VoucherLines"] = extracted.get("VoucherLines", [])
+        if len(extracted_orders) == 1:
+            result = _process_extracted_order(
+                extracted=extracted_orders[0],
+                persistence_file_id=file_id,
+                file_name=file_name,
+                folder_name=folder_name,
+                pdf_url=pdf_url,
+            )
+            if not result["retry_required"]:
+                mark_as_processed(file_id, file_name)
+            return result
 
-        summary = build_summary(extracted_for_save, file_name, folder_name)
-        erp_alerts = erp_result.get("payload_sent", {}).get("alerts", []) or []
-        summary["alerts"] = erp_alerts
-        summary["requires_double_check"] = bool(erp_result.get("payload_sent", {}).get("requires_double_check"))
+        # One physical MCC PDF can represent multiple ERP purchase orders. The
+        # first row keeps the source file ID so existing processed-file checks
+        # remain unchanged; additional dashboard rows use deterministic child
+        # IDs and still point to the same source PDF.
+        child_results: list[dict] = []
+        for index, child in enumerate(extracted_orders):
+            child_order_number = str(child.get("OurOrderNumber") or "").strip()
+            child_file_id = (
+                file_id
+                if index == 0
+                else f"{file_id}:mcc:{child_order_number}"
+            )
+            try:
+                child_result = _process_extracted_order(
+                    extracted=child,
+                    persistence_file_id=child_file_id,
+                    file_name=file_name,
+                    folder_name=folder_name,
+                    pdf_url=pdf_url,
+                )
+            except Exception as child_error:
+                logger.exception(
+                    "Combined MCC child failed: file_name=%s, order_number=%s",
+                    file_name,
+                    child_order_number,
+                )
+                _save_failure(
+                    child_file_id,
+                    file_name,
+                    folder_name,
+                    pdf_url,
+                    str(child_error),
+                )
+                child_result = {
+                    "status": "failure",
+                    "attention": False,
+                    "attention_reasons": [],
+                    "order_number": child_order_number,
+                    "supplier": child.get("Supplier", "Unknown"),
+                    "retry_required": False,
+                    "error": str(child_error),
+                }
+            child_results.append(child_result)
 
-        # attention is intentionally narrower than requires_double_check / alerts above.
-        # Those keep working exactly as before (unit-factor, quantity, surcharge,
-        # delivery-date-over-a-week all still show up as warnings on the order).
-        # attention is ONLY set for the two things that should actually pull the client's
-        # eye to the dashboard:
-        #   1. format/pricing mismatch  -> PDF total doesn't match the calculated total
-        #   2. fewer lines than expected -> some PDF/PO lines are missing
-        _ATTENTION_ALERT_TYPES = {
-            "pdf_total_mismatch",
-            "fewer_lines_than_expected",
-            "mcc_discount_differs_from_default",
-            "mcc_sales_price_update_failed",
-            "mcc_sales_price_validation_failed",
-        }
-        attention_alerts = [a for a in erp_alerts if a.get("type") in _ATTENTION_ALERT_TYPES]
-        attention = bool(attention_alerts)
-        attention_reasons = [a.get("message", a.get("type", "")) for a in attention_alerts]
-        order_status = "attention" if attention else "success"
-
-        # Step 4 - save success
-        _save_success(
-            file_id=file_id,
-            file_name=file_name,
-            folder_name=folder_name,
-            pdf_url=pdf_url,
-            order_number=order_number,
-            supplier=supplier,
-            extracted=extracted_for_save,
-            summary=summary,
-            erp_record_id=erp_result.get("erp_record_id", ""),
-            erp_voucher_number=erp_result.get("voucher_number", ""),
-            erp_supplier_number=erp_result.get("supplier_number", ""),
-            erp_article_no=erp_result.get("erp_article_numbers", ""),
-            attention=attention,
-            attention_reasons=attention_reasons,
-            status=order_status,
-        )
-        # A transient/verification failure while saving MCC article prices must
-        # be retried on the next sync. Validation warnings are processed once
-        # because repeating extraction cannot repair an invalid PDF value.
-        retry_mcc_sales_prices = any(
-            alert.get("type") == "mcc_sales_price_update_failed"
-            for alert in erp_alerts
-        )
-        if not retry_mcc_sales_prices:
+        retry_required = any(result.get("retry_required") for result in child_results)
+        if not retry_required:
             mark_as_processed(file_id, file_name)
 
+        statuses = {result["status"] for result in child_results}
+        overall_status = (
+            "failure"
+            if "failure" in statuses
+            else "attention"
+            if "attention" in statuses
+            else "success"
+        )
+        attention_reasons = [
+            reason
+            for result in child_results
+            for reason in result.get("attention_reasons", [])
+        ]
         return {
-            "status": order_status,
-            "attention": attention,
+            "status": overall_status,
+            "attention": overall_status == "attention",
             "attention_reasons": attention_reasons,
-            "order_number": order_number,
-            "supplier": supplier,
-            "erp_record_id": erp_result.get("erp_record_id"),
-            "erp_voucher_number": erp_result.get("voucher_number"),
-            "erp_supplier_number": erp_result.get("supplier_number"),
-            "erp_article_no": erp_result.get("erp_article_numbers"),
-            "retry_required": retry_mcc_sales_prices,
+            "supplier": extracted.get("Supplier", "Unknown"),
+            "order_count": len(child_results),
+            "orders": child_results,
+            "retry_required": retry_required,
         }
 
     except Exception as error:
@@ -483,6 +589,10 @@ def get_order_pdf_view(order_id: int):
         )
 
     file_id = str(order.get("file_id") or "").strip()
+    # Additional logical orders from one combined MCC PDF use deterministic
+    # child IDs in the dashboard, but all of them open the same source PDF.
+    if ":mcc:" in file_id:
+        file_id = file_id.split(":mcc:", 1)[0]
     if not file_id.isdecimal():
         raise OrderPdfNotAvailableError(
             "This order does not have a valid pCloud file ID."

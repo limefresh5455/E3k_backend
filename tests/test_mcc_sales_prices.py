@@ -2,6 +2,8 @@ import importlib
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+import fitz
+
 from app.services.erp_service import (
     _update_article_sales_prices,
     _update_voucher_line,
@@ -10,14 +12,107 @@ from app.services.erp_service import (
 from app.services.extraction_service import (
     _apply_mcc_table_validation,
     _calculate_mcc_sales_prices,
+    _extract_mcc_table_rows,
     _is_mcc_order_confirmation,
     _mcc_line_total_matches,
+    split_mcc_combined_order_data,
 )
 from app.services.order_service import _run_pipeline
 
 
 MCC_TEXT = "MCC Millennium Coupling Netto Preis Gesamtpreis Preis/ME"
 sync_api = importlib.import_module("app.api.sync")
+
+
+class MccCombinedOrderSplitTests(unittest.TestCase):
+    @staticmethod
+    def _synthetic_combined_pdf():
+        document = fitz.open()
+        page = document.new_page()
+        page.insert_text((50, 50), "Ihr Beleg 2601000")
+
+        def add_row(y, article, position=None):
+            if position:
+                page.insert_text((51, y), position)
+            page.insert_text((79, y), article)
+            page.insert_text((278, y), "2026/43")
+            page.insert_text((342, y), "2Stk")
+            page.insert_text((399, y), "10,00")
+            page.insert_text((445, y), "4,50")
+            page.insert_text((501, y), "9,00")
+            page.insert_text((388, y + 12), "55,00 %")
+
+        add_row(100, "ANY-ONE", "1")
+        page.insert_text((79, 150), "Order 2601001")
+        add_row(180, "FUTURE/TWO")
+        pdf_bytes = document.tobytes()
+        document.close()
+        return pdf_bytes
+
+    def test_physical_parser_supports_decimal_or_missing_positions_and_dynamic_articles(self):
+        rows = _extract_mcc_table_rows(self._synthetic_combined_pdf())
+
+        self.assertEqual([row["number"] for row in rows], ["ANY-ONE", "FUTURE/TWO"])
+        self.assertEqual([row["order_number"] for row in rows], ["2601000", "2601001"])
+        self.assertEqual([row["position"] for row in rows], ["1", None])
+        self.assertEqual([row["delivery_date"] for row in rows], ["23.10.2026"] * 2)
+
+    def test_splits_dynamic_articles_by_detected_order_sections(self):
+        extracted = {
+            "Supplier": "MCC Millennium Coupling Germany GmbH",
+            "OurOrderNumber": "2601519",
+            "IsMccOrderConfirmation": True,
+            "MccDetectedOrderNumbers": ["2601519", "2601559"],
+            "TotalNetFromPdf": 36.0,
+            "VoucherLines": [
+                {
+                    "Number": "ANY-DYNAMIC-ARTICLE",
+                    "LineTotal": 10.0,
+                    "MccOrderNumber": "2601519",
+                },
+                {
+                    "Number": "A/FUTURE.ARTICLE-99",
+                    "LineTotal": 20.0,
+                    "MccOrderNumber": "2601559",
+                },
+                # An unannotated continuation remains in the current physical
+                # section instead of depending on an article allow-list.
+                {"Number": "ANOTHER-ARTICLE", "LineTotal": 6.0},
+            ],
+        }
+
+        result = split_mcc_combined_order_data(extracted)
+
+        self.assertEqual([item["OurOrderNumber"] for item in result], ["2601519", "2601559"])
+        self.assertEqual(
+            [[line["Number"] for line in item["VoucherLines"]] for item in result],
+            [["ANY-DYNAMIC-ARTICLE"], ["A/FUTURE.ARTICLE-99", "ANOTHER-ARTICLE"]],
+        )
+        self.assertEqual([item["TotalNetFromPdf"] for item in result], [10.0, 26.0])
+        self.assertTrue(all(item["IsMccCombinedConfirmation"] for item in result))
+
+    def test_non_mcc_payload_is_returned_unchanged(self):
+        extracted = {
+            "OurOrderNumber": "2601000",
+            "VoucherLines": [{"Number": "ARTICLE"}],
+        }
+
+        result = split_mcc_combined_order_data(extracted)
+
+        self.assertEqual(result, [extracted])
+        self.assertIs(result[0], extracted)
+
+    def test_rejects_detected_order_without_any_lines(self):
+        extracted = {
+            "IsMccOrderConfirmation": True,
+            "MccDetectedOrderNumbers": ["2601000", "2601001"],
+            "VoucherLines": [
+                {"Number": "ARTICLE", "MccOrderNumber": "2601000"},
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "2601001"):
+            split_mcc_combined_order_data(extracted)
 
 
 class MccSalesPriceCalculationTests(unittest.TestCase):
@@ -219,6 +314,52 @@ class MccValidatedLineTests(unittest.TestCase):
             ["ABC", "ABC1"],
         )
         self.assertNotIn("MccDuplicateLineCount", result)
+
+    @patch("app.services.extraction_service._extract_mcc_table_rows")
+    def test_repairs_article_number_with_description_appended_by_llm(self, rows_mock):
+        row = self._mms1010_row()
+        row["number"] = "ST100/100D"
+        rows_mock.return_value = [row]
+        extracted = {
+            "VoucherLines": [
+                {"Number": "ST100/100DDN100/A(115mm)", "LineTotal": 5.09},
+            ]
+        }
+
+        result = _apply_mcc_table_validation(MCC_TEXT, b"pdf", extracted)
+
+        self.assertEqual(result["VoucherLines"][0]["Number"], "ST100/100D")
+        self.assertEqual(result["MccRecoveredLineCount"], 0)
+
+    @patch("app.services.extraction_service._extract_mcc_table_rows")
+    def test_recovers_validated_rows_when_llm_omits_an_order_section(self, rows_mock):
+        first_row = dict(self._mms1010_row(), order_number="2601000")
+        second_row = dict(
+            self._mms1010_row(),
+            number="DYNAMIC-SECOND",
+            description="Recovered MCC article",
+            delivery_date="23.10.2026",
+            order_number="2601001",
+        )
+        rows_mock.return_value = [first_row, second_row]
+        extracted = {
+            "Supplier": "MCC",
+            "OurOrderNumber": "2601000",
+            "VoucherLines": [{"Number": "MMS1010F", "LineTotal": 5.09}],
+        }
+
+        validated = _apply_mcc_table_validation(MCC_TEXT, b"pdf", extracted)
+        result = split_mcc_combined_order_data(validated)
+
+        self.assertEqual(validated["MccRecoveredLineCount"], 1)
+        self.assertEqual(
+            [child["OurOrderNumber"] for child in result],
+            ["2601000", "2601001"],
+        )
+        recovered_line = result[1]["VoucherLines"][0]
+        self.assertEqual(recovered_line["Number"], "DYNAMIC-SECOND")
+        self.assertEqual(recovered_line["Description"], "Recovered MCC article")
+        self.assertEqual(recovered_line["DeliveryDate"], "23.10.2026")
 
 
 class ErpArticleSalesPriceTests(unittest.TestCase):
@@ -441,6 +582,76 @@ class ErpMccSalesPriceFlowTests(unittest.TestCase):
             alert["type"] for alert in result["payload_sent"].get("alerts", [])
         }
         self.assertNotIn("mcc_sales_price_validation_failed", alert_types)
+
+class MccCombinedOrderPipelineTests(unittest.TestCase):
+    @patch("app.services.order_service.mark_as_processed")
+    @patch("app.services.order_service._save_success")
+    @patch("app.services.order_service.build_summary", side_effect=lambda *_args: {})
+    @patch("app.services.order_service.push_to_erp")
+    @patch("app.services.order_service.extract_order_data")
+    @patch("app.services.order_service.extract_text_from_bytes", return_value=("PDF", False))
+    def test_processes_each_combined_order_through_existing_erp_flow(
+        self,
+        _text_mock,
+        extract_mock,
+        push_mock,
+        _summary_mock,
+        save_mock,
+        processed_mock,
+    ):
+        extract_mock.return_value = {
+            "Supplier": "MCC",
+            "OurOrderNumber": "2601000",
+            "IsMccOrderConfirmation": True,
+            "MccDetectedOrderNumbers": ["2601000", "2601001"],
+            "VoucherLines": [
+                {
+                    "Number": "DYNAMIC-A",
+                    "LineTotal": 10.0,
+                    "MccOrderNumber": "2601000",
+                },
+                {
+                    "Number": "DYNAMIC-B",
+                    "LineTotal": 20.0,
+                    "MccOrderNumber": "2601001",
+                },
+            ],
+        }
+
+        def erp_result(child):
+            order_number = child["OurOrderNumber"]
+            number = child["VoucherLines"][0]["Number"]
+            return {
+                "erp_record_id": order_number,
+                "voucher_number": order_number,
+                "supplier_number": "007121",
+                "erp_article_numbers": number,
+                "payload_sent": {
+                    "updated_pdf_numbers": [number],
+                    "updated_line_totals": {number: child["VoucherLines"][0]["LineTotal"]},
+                    "updated_line_quantities": {},
+                    "updated_line_erp_article_numbers": {number: number},
+                    "alerts": [],
+                    "requires_double_check": False,
+                },
+            }
+
+        push_mock.side_effect = erp_result
+
+        result = _run_pipeline(b"pdf", "source-1", "combined.pdf", "MCC", "url")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["order_count"], 2)
+        self.assertEqual(
+            [call.args[0]["OurOrderNumber"] for call in push_mock.call_args_list],
+            ["2601000", "2601001"],
+        )
+        self.assertEqual(
+            [call.kwargs["file_id"] for call in save_mock.call_args_list],
+            ["source-1", "source-1:mcc:2601001"],
+        )
+        processed_mock.assert_called_once_with("source-1", "combined.pdf")
+
 
 class MccOrderPipelineFailureTests(unittest.TestCase):
     @patch("app.services.order_service.mark_as_processed")

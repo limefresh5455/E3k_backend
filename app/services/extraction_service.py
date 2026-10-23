@@ -1315,51 +1315,148 @@ def _mcc_line_total_matches(
     return printed_total == expected_total
 
 
+_MCC_BUYER_ORDER_NUMBER_RE = r"(?<!\d)(\d{7})(?!\d)"
+
+
+def _mcc_page_order_markers(page, page_index: int) -> list[dict]:
+    """Return MCC buyer-order section markers with physical positions."""
+    markers: list[dict] = []
+    page_text = page.get_text("text")
+
+    # The first buyer order is printed in the document header. The number can
+    # be vertically separated from the label, so extracted text order is more
+    # reliable here than requiring both values on one physical baseline.
+    header_match = re.search(
+        rf"Ihr\s+Beleg\s*{_MCC_BUYER_ORDER_NUMBER_RE}",
+        page_text,
+        flags=re.IGNORECASE,
+    )
+    if header_match:
+        markers.append(
+            {
+                "order_number": header_match.group(1),
+                "page_index": page_index,
+                "y": -1.0,
+                "kind": "header",
+            }
+        )
+
+    words = page.get_text("words")
+    line_ys = sorted({round(word[1], 1) for word in words})
+    for line_y in line_ys:
+        line_words = sorted(
+            (word for word in words if abs(word[1] - line_y) <= 1.0),
+            key=lambda word: word[0],
+        )
+        line_text = " ".join(str(word[4]) for word in line_words)
+        section_match = re.search(
+            rf"\b(?:Order|Bestellung)\s*[:#-]?\s*{_MCC_BUYER_ORDER_NUMBER_RE}",
+            line_text,
+            flags=re.IGNORECASE,
+        )
+        if section_match:
+            markers.append(
+                {
+                    "order_number": section_match.group(1),
+                    "page_index": page_index,
+                    "y": float(line_y),
+                    "kind": "table_section",
+                }
+            )
+
+    unique: list[dict] = []
+    seen: set[tuple[str, int, float]] = set()
+    for marker in sorted(markers, key=lambda item: (item["page_index"], item["y"])):
+        key = (marker["order_number"], marker["page_index"], marker["y"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(marker)
+    return unique
+
+
+def _mcc_row_order_number(markers: list[dict], page_index: int, row_y: float) -> str | None:
+    preceding = [
+        marker
+        for marker in markers
+        if (marker["page_index"], marker["y"]) <= (page_index, row_y)
+    ]
+    return preceding[-1]["order_number"] if preceding else None
+
+
 def _extract_mcc_table_rows(pdf_bytes: bytes) -> list[dict]:
-    """Read MCC table values from their physical PDF columns, page by page."""
+    """Read MCC rows without assuming fixed article or position values."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     rows: list[dict] = []
     try:
-        for page in doc:
-            words = page.get_text("words")
-            position_words = [
-                word for word in words
-                if 45 <= word[0] <= 65 and re.fullmatch(r"\d{1,3}", word[4])
-            ]
-            position_words.sort(key=lambda word: word[1])
+        markers = [
+            marker
+            for page_index, page in enumerate(doc)
+            for marker in _mcc_page_order_markers(page, page_index)
+        ]
+        markers.sort(key=lambda item: (item["page_index"], item["y"]))
 
-            for index, position_word in enumerate(position_words):
-                row_y = position_word[1]
+        for page_index, page in enumerate(doc):
+            words = page.get_text("words")
+
+            # MCC may print decimal positions (7.1) or no position at all.
+            # Anchor rows on the article column plus all numeric price columns.
+            candidate_ys = sorted(
+                {
+                    round(word[1], 1)
+                    for word in words
+                    if 70 <= word[0] < 124
+                    and re.search(r"[A-Za-z0-9]", str(word[4]))
+                }
+            )
+            physical_rows: list[tuple[float, list]] = []
+            for row_y in candidate_ys:
+                baseline = [word for word in words if abs(word[1] - row_y) <= 1.5]
+                columns = (
+                    [word[4] for word in baseline if 70 <= word[0] < 124],
+                    [word[4] for word in baseline if 325 <= word[0] < 385],
+                    [word[4] for word in baseline if 385 <= word[0] < 425],
+                    [word[4] for word in baseline if 425 <= word[0] < 477],
+                    [word[4] for word in baseline if 477 <= word[0] < 545],
+                )
+                if all(columns):
+                    physical_rows.append((row_y, baseline))
+
+            for index, (row_y, baseline) in enumerate(physical_rows):
                 next_y = (
-                    position_words[index + 1][1]
-                    if index + 1 < len(position_words)
+                    physical_rows[index + 1][0]
+                    if index + 1 < len(physical_rows)
                     else page.rect.height
                 )
-                baseline = [word for word in words if abs(word[1] - row_y) <= 1.5]
-
-                article_parts = [
-                    word[4] for word in baseline if 70 <= word[0] < 124
+                article_parts = [word[4] for word in baseline if 70 <= word[0] < 124]
+                description_parts = [
+                    word[4]
+                    for word in sorted(baseline, key=lambda item: item[0])
+                    if 124 <= word[0] < 270
                 ]
-                quantity_parts = [
-                    word[4] for word in baseline if 325 <= word[0] < 385
-                ]
-                gross_parts = [
-                    word[4] for word in baseline if 385 <= word[0] < 425
-                ]
-                net_parts = [
-                    word[4] for word in baseline if 425 <= word[0] < 477
-                ]
-                total_parts = [
-                    word[4] for word in baseline if 477 <= word[0] < 545
-                ]
-                if not all((article_parts, quantity_parts, gross_parts, net_parts, total_parts)):
-                    continue
+                delivery_parts = [word[4] for word in baseline if 270 <= word[0] < 325]
+                quantity_parts = [word[4] for word in baseline if 325 <= word[0] < 385]
+                gross_parts = [word[4] for word in baseline if 385 <= word[0] < 425]
+                net_parts = [word[4] for word in baseline if 425 <= word[0] < 477]
+                total_parts = [word[4] for word in baseline if 477 <= word[0] < 545]
+                position = next(
+                    (
+                        str(word[4])
+                        for word in baseline
+                        if 45 <= word[0] < 70
+                        and re.fullmatch(r"\d+(?:\.\d+)?", str(word[4]))
+                    ),
+                    None,
+                )
 
                 discount_words = [
-                    word for word in words
+                    word
+                    for word in words
                     if row_y < word[1] < next_y and 375 <= word[0] < 430
                 ]
-                discount_text = " ".join(word[4] for word in sorted(discount_words, key=lambda w: (w[1], w[0])))
+                discount_text = " ".join(
+                    word[4]
+                    for word in sorted(discount_words, key=lambda item: (item[1], item[0]))
+                )
                 discount_candidates = [
                     _mcc_number(match.group(1))
                     for match in re.finditer(r"(\d+(?:[.,]\d+)?)\s*%", discount_text)
@@ -1373,30 +1470,14 @@ def _extract_mcc_table_rows(pdf_bytes: bytes) -> list[dict]:
                 if None in (quantity, gross_price, net_price, line_total):
                     continue
 
-                # Accept a row only when both independent price relationships
-                # agree with the printed values. This prevents column-position
-                # assumptions from silently changing an unfamiliar layout.
                 pricing = None
-                # A row may contain more than one percentage in its vertical
-                # region. Select only a percentage whose arithmetic agrees with
-                # the printed net price. If none does, try MCC's 55% default.
                 for discount in discount_candidates:
-                    pricing = _calculate_mcc_sales_prices(
-                        gross_price,
-                        net_price,
-                        discount,
-                    )
+                    pricing = _calculate_mcc_sales_prices(gross_price, net_price, discount)
                     if pricing is not None:
                         break
                 if pricing is None:
-                    pricing = _calculate_mcc_sales_prices(
-                        gross_price,
-                        net_price,
-                        None,
-                    )
-                if pricing is None:
-                    continue
-                if not _mcc_line_total_matches(
+                    pricing = _calculate_mcc_sales_prices(gross_price, net_price, None)
+                if pricing is None or not _mcc_line_total_matches(
                     quantity,
                     pricing["purchase_net_price"],
                     line_total,
@@ -1404,11 +1485,29 @@ def _extract_mcc_table_rows(pdf_bytes: bytes) -> list[dict]:
                     continue
 
                 unit_match = re.search(r"[A-Za-zÄÖÜäöü]+", quantity_token)
+                delivery_match = re.search(
+                    r"\b(20\d{2})/([0-5]?\d)\b",
+                    "".join(delivery_parts),
+                )
+                delivery_date = (
+                    _friday_of_iso_week(
+                        int(delivery_match.group(1)),
+                        int(delivery_match.group(2)),
+                    )
+                    if delivery_match
+                    else None
+                )
                 rows.append(
                     {
                         "number": "".join(article_parts),
+                        "description": " ".join(description_parts).strip() or None,
+                        "position": position,
+                        "page_index": page_index,
+                        "row_y": row_y,
+                        "order_number": _mcc_row_order_number(markers, page_index, row_y),
                         "quantity": quantity,
                         "unit": unit_match.group(0) if unit_match else None,
+                        "delivery_date": delivery_date,
                         "gross_price": gross_price,
                         "net_price": net_price,
                         **pricing,
@@ -1431,7 +1530,16 @@ def _apply_mcc_table_validation(pdf_text: str, pdf_bytes: bytes, extracted: dict
 
     extracted["IsMccOrderConfirmation"] = True
     parsed_rows = _extract_mcc_table_rows(pdf_bytes)
-    voucher_lines = extracted.get("VoucherLines", [])
+    detected_order_numbers = list(
+        dict.fromkeys(
+            str(row.get("order_number") or "").strip()
+            for row in parsed_rows
+            if str(row.get("order_number") or "").strip()
+        )
+    )
+    if detected_order_numbers:
+        extracted["MccDetectedOrderNumbers"] = detected_order_numbers
+    voucher_lines = extracted.setdefault("VoucherLines", [])
     parsed_row_numbers = {
         _normalized_article_number(row["number"])
         for row in parsed_rows
@@ -1440,6 +1548,7 @@ def _apply_mcc_table_validation(pdf_text: str, pdf_bytes: bytes, extracted: dict
     used_line_indexes: set[int] = set()
     duplicate_line_indexes: set[int] = set()
     corrected = 0
+    recovered = 0
 
     # Match from the authoritative physical PDF rows to extracted lines. Exact
     # article-number matches must win over prefix matches: recovery can add the
@@ -1478,11 +1587,36 @@ def _apply_mcc_table_validation(pdf_text: str, pdf_bytes: bytes, extracted: dict
         elif approximate_indexes:
             matched_index = approximate_indexes[0]
         else:
-            continue
+            # The LLM can omit a complete order section even though its rows
+            # are present and arithmetically validated in the physical MCC
+            # table. Recover only those validated MCC rows and pass them into
+            # the existing VoucherLine/ERP flow.
+            voucher_lines.append(
+                {
+                    "$type": (
+                        "E3k.Web.Objects.DataTransfer.VoucherLines."
+                        "ArticleVoucherLine, E3k.Web.Objects.DataTransfer"
+                    ),
+                    "Number": row["number"],
+                    "Quantity": row["quantity"],
+                    "GrossPrice": row["gross_price"],
+                    "DiscountPercent": row["discount_percent"],
+                    "LineTotal": row["line_total"],
+                    "Description": row.get("description") or f"Recovered line {row['number']}",
+                    "DescriptionUnit": row.get("unit"),
+                    "VatCode": "01",
+                    "DeliveryDate": row.get("delivery_date") or extracted.get("DeliveryDate"),
+                }
+            )
+            matched_index = len(voucher_lines) - 1
+            recovered += 1
 
         used_line_indexes.add(matched_index)
         line = voucher_lines[matched_index]
         replacements = {
+            # The physical article column is authoritative. This repairs LLM
+            # values which accidentally contain adjacent description text.
+            "Number": row["number"],
             "Quantity": row["quantity"],
             "GrossPrice": row["gross_price"],
             "DiscountPercent": row["discount_percent"],
@@ -1491,7 +1625,11 @@ def _apply_mcc_table_validation(pdf_text: str, pdf_bytes: bytes, extracted: dict
             "MccDefaultDiscountApplied": row["default_discount_applied"],
             "MccDiscountDiffersFromDefault": row["discount_differs_from_default"],
         }
-        if line_number == "VERSCH":
+        if row.get("order_number"):
+            replacements["MccOrderNumber"] = str(row["order_number"])
+        if row.get("position"):
+            replacements["MccPosition"] = str(row["position"])
+        if row_number == "VERSCH":
             replacements["MccSalesPriceExcluded"] = True
         else:
             replacements["MccSalesPriceNet"] = row["sales_price_net"]
@@ -1517,13 +1655,82 @@ def _apply_mcc_table_validation(pdf_text: str, pdf_bytes: bytes, extracted: dict
 
     extracted["MccValidatedLineCount"] = len(parsed_rows)
     extracted["MccCorrectedLineCount"] = corrected
+    extracted["MccRecoveredLineCount"] = recovered
     logger.info(
-        "MCC table validation completed: verified=%d, corrected=%d, extracted=%d",
+        "MCC table validation completed: verified=%d, corrected=%d, recovered=%d, extracted=%d",
         len(parsed_rows),
         corrected,
+        recovered,
         len(extracted.get("VoucherLines", [])),
     )
     return extracted
+
+
+def split_mcc_combined_order_data(extracted: dict) -> list[dict]:
+    """Split a validated combined MCC confirmation into normal order payloads.
+
+    Non-MCC and single-order MCC data is returned unchanged. The function uses
+    physical section assignments produced by ``_extract_mcc_table_rows``; it
+    never relies on a fixed article list or a fixed number of orders.
+    """
+    if not extracted.get("IsMccOrderConfirmation"):
+        return [extracted]
+
+    detected_order_numbers = [
+        str(value).strip()
+        for value in extracted.get("MccDetectedOrderNumbers", [])
+        if str(value).strip()
+    ]
+    detected_order_numbers = list(dict.fromkeys(detected_order_numbers))
+    if len(detected_order_numbers) <= 1:
+        return [extracted]
+
+    grouped_lines: dict[str, list[dict]] = {
+        order_number: [] for order_number in detected_order_numbers
+    }
+    current_order = detected_order_numbers[0]
+    for source_line in extracted.get("VoucherLines", []) or []:
+        line = dict(source_line)
+        assigned_order = str(line.get("MccOrderNumber") or "").strip()
+        if assigned_order:
+            if assigned_order not in grouped_lines:
+                raise ValueError(
+                    f"Unbekannte MCC-Bestellreferenz '{assigned_order}' in einer Belegzeile."
+                )
+            current_order = assigned_order
+        line["MccOrderNumber"] = current_order
+        grouped_lines[current_order].append(line)
+
+    empty_orders = [
+        order_number
+        for order_number, lines in grouped_lines.items()
+        if not lines
+    ]
+    if empty_orders:
+        raise ValueError(
+            "MCC-Sammelbestätigung konnte nicht sicher aufgeteilt werden; "
+            "keine Artikelzeilen für Bestellung(en): " + ", ".join(empty_orders)
+        )
+
+    children: list[dict] = []
+    order_count = len(detected_order_numbers)
+    for order_number in detected_order_numbers:
+        child = dict(extracted)
+        child_lines = grouped_lines[order_number]
+        child["OurOrderNumber"] = order_number
+        child["VoucherLines"] = child_lines
+        child["IsMccCombinedConfirmation"] = True
+        child["MccCombinedOrderCount"] = order_count
+        # The document total covers all embedded orders. Give the existing ERP
+        # validation a child-specific total so it cannot raise a false mismatch.
+        child["MccDocumentTotalNetFromPdf"] = extracted.get("TotalNetFromPdf")
+        child["TotalNetFromPdf"] = round(
+            sum(_as_float(line.get("LineTotal"), default=0.0) for line in child_lines),
+            2,
+        )
+        children.append(child)
+
+    return children
 
 
 def extract_order_data(pdf_text: str, pdf_bytes: bytes) -> dict:

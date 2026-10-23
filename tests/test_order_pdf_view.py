@@ -165,6 +165,22 @@ class OrderPdfViewServiceTests(unittest.TestCase):
         )
         url_mock.assert_called_once_with("123456789")
 
+    @patch("app.services.order_service.pcloud_get_file_preview_url")
+    @patch("app.services.order_service.get_order")
+    def test_combined_mcc_child_opens_the_shared_source_pdf(self, get_order_mock, url_mock):
+        get_order_mock.return_value = {
+            "id": 43,
+            "file_id": "123456789:mcc:2601559",
+            "file_name": "mcc-combined.pdf",
+            "pdf_url": "https://e.pcloud.com/#page=publink&code=old&fileid=123456789",
+        }
+        url_mock.return_value = "https://e.pcloud.link/publink/show?code=pdf-code"
+
+        result = get_order_pdf_view(43)
+
+        self.assertEqual(result["view_url"], url_mock.return_value)
+        url_mock.assert_called_once_with("123456789")
+
     @patch("app.services.order_service.get_order", return_value=None)
     def test_returns_none_for_unknown_order(self, _get_order_mock):
         self.assertIsNone(get_order_pdf_view(999))
