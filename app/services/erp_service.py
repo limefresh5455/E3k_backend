@@ -1,5 +1,5 @@
 from datetime import datetime
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 import logging
 import math
 import re
@@ -10,7 +10,8 @@ from urllib.parse import quote
 
 import requests
 
-from app.config import ERP_BASE_URL, ERP_PASSWORD, ERP_USERNAME
+from app.config import ERP_BASE_URL, ERP_PASSWORD, ERP_SALES_VAT_RATES, ERP_USERNAME
+from app.services.erp_auth_alert_service import schedule_erp_unauthorized_alert
 
 logger = logging.getLogger("erp_service")
 
@@ -24,6 +25,14 @@ ERP_REQUEST_TIMEOUT = 120          # was 30 — give slow-but-working calls more
 ERP_MAX_RETRIES = 5                # total attempts per call
 ERP_BASE_BACKOFF = 15               # seconds, doubles each retry
 ERP_MAX_BACKOFF = 120                # cap the wait between retries
+
+MCC_SALES_MULTIPLIER = Decimal("4")
+# SupplierArticle table T083: Umrechnungsfaktor Lager / Faktor Lagerbestand.
+MCC_STOCK_FACTOR_FIELD = "F045"
+MCC_UNIT_FIELD = "F047"
+MCC_DEFAULT_PIECE_FACTOR = 1.0
+MCC_DEFAULT_ROLL_LENGTH_METERS = 25.0
+ARTICLE_SALES_VAT_CODE_FIELD = "F019"
 
 
 def _auth() -> tuple[str, str]:
@@ -73,6 +82,9 @@ def _erp_request(method: str, url: str, *, context: str, **kwargs) -> requests.R
                 f"({ERP_REQUEST_TIMEOUT}s each). The ERP server may be slow or unavailable. "
                 f"Last error: {exc}"
             ) from exc
+
+        if response.status_code == 401:
+            schedule_erp_unauthorized_alert(method, url)
 
         if response.status_code == 429 or response.status_code >= 500:
             if attempt < ERP_MAX_RETRIES - 1:
@@ -140,6 +152,45 @@ def _as_float(value, default: float = 0.0) -> float:
         return float(text)
     except (TypeError, ValueError):
         return default
+
+
+def _round_up_to_ten_rappen(value: Decimal) -> Decimal:
+    """Round a positive amount upward to the next CHF 0.10 boundary."""
+    return value.quantize(Decimal("0.1"), rounding=ROUND_CEILING)
+
+
+def _calculate_mcc_sales_prices(
+    purchase_net_price: float,
+    stock_factor: float,
+    vat_percent: float,
+) -> dict[str, float]:
+    """Convert an MCC purchase-unit price into rounded net and gross sale prices."""
+    try:
+        purchase_net = Decimal(str(purchase_net_price))
+        factor = Decimal(str(stock_factor))
+        vat = Decimal(str(vat_percent))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError("MCC sales-price inputs must be valid numbers.") from error
+
+    if purchase_net <= 0:
+        raise ValueError("MCC purchase net price must be greater than zero.")
+    if factor <= 0:
+        raise ValueError(
+            f"MCC Faktor Lagerbestand ({MCC_STOCK_FACTOR_FIELD}) must be greater "
+            "than zero."
+        )
+    if vat < 0 or vat > 100:
+        raise ValueError("MCC sales VAT percentage must be between 0 and 100.")
+
+    sales_price_net = _round_up_to_ten_rappen(
+        purchase_net / factor * MCC_SALES_MULTIPLIER
+    )
+    vat_multiplier = Decimal("1") + vat / Decimal("100")
+    sales_price_gross = _round_up_to_ten_rappen(sales_price_net * vat_multiplier)
+    return {
+        "net": float(sales_price_net),
+        "gross": float(sales_price_gross),
+    }
 
 
 def _truncate_decimals(value: float, decimals: int = 2) -> float:
@@ -479,6 +530,94 @@ def _lookup_supplier_article_f028(supplier_no: str, article_no: str) -> Optional
             supplier_no, article_no, exc,
         )
         return None
+
+
+def _get_mcc_pricing_context(supplier_no: str, article_no: str) -> dict[str, float | str]:
+    """Load MCC's stock conversion factor and the article's configured sales VAT."""
+    supplier_no = str(supplier_no or "").strip()
+    article_no = str(article_no or "").strip()
+    if not supplier_no or not article_no:
+        raise ValueError("Supplier and ERP article numbers are required for MCC pricing.")
+
+    supplier_response = _erp_request(
+        "POST",
+        f"{ERP_BASE_URL}/api/SupplierArticle/Custom",
+        context=f"SupplierArticle/Custom MCC pricing (article={article_no})",
+        json={
+            "Fields": [MCC_STOCK_FACTOR_FIELD, MCC_UNIT_FIELD],
+            "Filters": [
+                {"FieldNumber": 1, "Value": supplier_no, "Combine": 1, "Type": 1},
+                {"FieldNumber": 2, "Value": article_no, "Combine": 1, "Type": 1},
+            ],
+        },
+        auth=_auth(),
+    )
+    if not supplier_response.ok:
+        raise Exception(
+            f"ERP SupplierArticle lookup failed ({supplier_response.status_code}) for "
+            f"article '{article_no}': {supplier_response.text[:500]}"
+        )
+    supplier_rows = supplier_response.json()
+    if not isinstance(supplier_rows, list) or len(supplier_rows) != 1:
+        raise ValueError(
+            f"Expected one SupplierArticle record for supplier '{supplier_no}' and "
+            f"article '{article_no}', received {len(supplier_rows) if isinstance(supplier_rows, list) else 0}."
+        )
+    supplier_article = supplier_rows[0]
+    stock_factor = _as_float(
+        supplier_article.get(MCC_STOCK_FACTOR_FIELD), default=0.0
+    )
+    unit = str(supplier_article.get(MCC_UNIT_FIELD) or "").strip()
+    normalized_unit = unit.casefold().rstrip(".")
+    factor_source = "erp"
+    if stock_factor <= 0:
+        if normalized_unit in {"stk", "stück", "stuck", "pc", "pcs"}:
+            stock_factor = MCC_DEFAULT_PIECE_FACTOR
+            factor_source = "piece_default"
+        elif normalized_unit in {"rol", "rolle", "roll"}:
+            stock_factor = MCC_DEFAULT_ROLL_LENGTH_METERS
+            factor_source = "mcc_roll_default"
+        else:
+            raise ValueError(
+                f"Faktor Lagerbestand ({MCC_STOCK_FACTOR_FIELD}) is zero or empty "
+                f"and unit ({MCC_UNIT_FIELD}) '{unit}' is not supported for article "
+                f"'{article_no}'."
+            )
+
+    article_response = _erp_request(
+        "POST",
+        f"{ERP_BASE_URL}/api/Article/Key/{quote(article_no, safe='')}",
+        context=f"Article/Key MCC VAT lookup (article={article_no})",
+        json=[ARTICLE_SALES_VAT_CODE_FIELD],
+        auth=_auth(),
+    )
+    if not article_response.ok:
+        raise Exception(
+            f"ERP Article VAT lookup failed ({article_response.status_code}) for article "
+            f"'{article_no}': {article_response.text[:500]}"
+        )
+    article = article_response.json()
+    if not isinstance(article, dict):
+        raise ValueError(f"ERP returned invalid VAT data for article '{article_no}'.")
+
+    vat_code = str(article.get(ARTICLE_SALES_VAT_CODE_FIELD) or "").strip()
+    if not vat_code:
+        raise ValueError(f"Sales VAT code (F019) is empty for article '{article_no}'.")
+    configured_vat_code = vat_code.zfill(2) if vat_code.isdigit() else vat_code
+    vat_percent = ERP_SALES_VAT_RATES.get(configured_vat_code)
+    if vat_percent is None:
+        raise ValueError(
+            f"Sales VAT code '{vat_code}' for article '{article_no}' is not configured "
+            "in ERP_SALES_VAT_RATES."
+        )
+
+    return {
+        "stock_factor": stock_factor,
+        "stock_unit": unit,
+        "factor_source": factor_source,
+        "vat_code": configured_vat_code,
+        "vat_percent": vat_percent,
+    }
 
 
 def _pick_best_erp_line(
@@ -931,6 +1070,7 @@ def push_to_erp(extracted: dict) -> dict:
     mcc_sales_price_validation_lines: list[dict] = []
     mcc_sales_price_error_lines: list[dict] = []
     mcc_sales_price_updates: dict[str, dict[str, float | str]] = {}
+    mcc_pricing_contexts: dict[str, dict[str, float | str]] = {}
     updated_line_totals: dict[str, float] = {}
     updated_line_quantities: dict[str, float] = {}
     updated_line_erp_article_numbers: dict[str, str] = {}
@@ -1051,15 +1191,39 @@ def push_to_erp(extracted: dict) -> dict:
                 }
             )
 
-        mcc_sales_price_net = pdf_line.get("MccSalesPriceNet")
-        mcc_sales_price_gross = pdf_line.get("MccSalesPriceGross")
         mcc_sales_price_excluded = bool(pdf_line.get("MccSalesPriceExcluded"))
-        has_valid_mcc_sales_prices = ( 
-            is_mcc_order
-            and not mcc_sales_price_excluded
-            and mcc_sales_price_net is not None
-            and mcc_sales_price_gross is not None
-        )
+        mcc_sales_prices = None
+        mcc_pricing_context = None
+        mcc_validation_error = None
+        if is_mcc_order and not mcc_sales_price_excluded:
+            purchase_net_price = pdf_line.get("MccPurchaseNetPrice")
+            if purchase_net_price is None:
+                mcc_validation_error = (
+                    "MCC gross price, discount, printed net price, or line total "
+                    "did not pass the purchase-price cross-check."
+                )
+            else:
+                try:
+                    mcc_pricing_context = mcc_pricing_contexts.get(erp_article_number)
+                    if mcc_pricing_context is None:
+                        mcc_pricing_context = _get_mcc_pricing_context(
+                            supplier_no, erp_article_number
+                        )
+                        mcc_pricing_contexts[erp_article_number] = mcc_pricing_context
+                    mcc_sales_prices = _calculate_mcc_sales_prices(
+                        purchase_net_price=_as_float(purchase_net_price),
+                        stock_factor=_as_float(mcc_pricing_context["stock_factor"]),
+                        vat_percent=_as_float(mcc_pricing_context["vat_percent"]),
+                    )
+                except Exception as exc:
+                    mcc_validation_error = str(exc)
+                    logger.warning(
+                        "MCC sales-price calculation skipped for ERP article=%s: %s",
+                        erp_article_number,
+                        exc,
+                    )
+
+        has_valid_mcc_sales_prices = mcc_sales_prices is not None
         # The purchase total originates in the PDF, so prefer its quantity for
         # the per-unit sales-price calculation. ERP quantity remains the
         # fallback when the PDF quantity is unavailable.
@@ -1086,7 +1250,7 @@ def push_to_erp(extracted: dict) -> dict:
             else None
         )
         voucher_line_sales_price_net = (
-            mcc_sales_price_net
+            mcc_sales_prices["net"]
             if has_valid_mcc_sales_prices
             else supplier_sales_price_net
         )
@@ -1117,8 +1281,8 @@ def push_to_erp(extracted: dict) -> dict:
             )
         if has_valid_mcc_sales_prices:
             proposed_prices = {
-                "net": round(_as_float(mcc_sales_price_net), 2),
-                "gross": round(_as_float(mcc_sales_price_gross), 2),
+                "net": round(_as_float(mcc_sales_prices["net"]), 2),
+                "gross": round(_as_float(mcc_sales_prices["gross"]), 2),
             }
             previous_update = mcc_sales_price_updates.get(erp_article_number)
             if previous_update is None:
@@ -1130,6 +1294,9 @@ def push_to_erp(extracted: dict) -> dict:
                     )
                     mcc_sales_price_updates[erp_article_number] = {
                         **proposed_prices,
+                        "stock_factor": _as_float(mcc_pricing_context["stock_factor"]),
+                        "vat_code": str(mcc_pricing_context["vat_code"]),
+                        "vat_percent": _as_float(mcc_pricing_context["vat_percent"]),
                         "erp_record_id": article_record_id,
                     }
                 except Exception as exc:
@@ -1155,14 +1322,11 @@ def push_to_erp(extracted: dict) -> dict:
                         "error": "Conflicting MCC sales prices for the same article in one order.",
                     }
                 )
-        elif is_mcc_order and not mcc_sales_price_excluded:
+        elif mcc_validation_error is not None:
             mcc_sales_price_validation_lines.append(
                 {
                     "article_number": erp_article_number,
-                    "error": (
-                        "MCC gross price, discount, printed net price, or line total "
-                        "did not pass the sales-price cross-check."
-                    ),
+                    "error": mcc_validation_error,
                 }
             )
         if surcharge_pct_applied > 0:

@@ -4,6 +4,7 @@ from typing import Any
 import requests
 
 from app.config import ERP_BASE_URL, ERP_PASSWORD, ERP_USERNAME
+from app.services.erp_auth_alert_service import schedule_erp_unauthorized_alert
 from app.supplier_addresses.errors import ErpSupplierSyncError
 
 
@@ -60,6 +61,8 @@ def create_supplier_in_erp(supplier: dict[str, Any]) -> str:
             auth=(ERP_USERNAME, ERP_PASSWORD),
             timeout=ERP_ADDRESS_TIMEOUT_SECONDS,
         )
+        if response.status_code == 401:
+            schedule_erp_unauthorized_alert("POST", url)
         response.raise_for_status()
         record_id = response.json()
     except (requests.RequestException, ValueError) as exc:

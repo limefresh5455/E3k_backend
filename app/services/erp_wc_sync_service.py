@@ -5,6 +5,8 @@ from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 import os
 
+from app.services.erp_auth_alert_service import schedule_erp_unauthorized_alert
+
 load_dotenv()
 
 logger = logging.getLogger("sync_engine")
@@ -92,6 +94,8 @@ def fetch_supplier_key(erp_id) -> str | None:
             headers={"accept": "application/json"},
             timeout=30,
         )
+        if resp.status_code == 401:
+            schedule_erp_unauthorized_alert("GET", url)
         resp.raise_for_status()
         data = resp.json()
         f020 = str(data.get("F020", "")).strip()
@@ -120,6 +124,8 @@ def fetch_delivery_days(supplier_key: str) -> int | None:
             json=["F031"],
             timeout=30,
         )
+        if resp.status_code == 401:
+            schedule_erp_unauthorized_alert("POST", url)
         resp.raise_for_status()
         data = resp.json()
         f031_raw = data.get("F031", "")
@@ -246,6 +252,8 @@ def fetch_erp_data() -> list[dict] | None:
                 headers={"accept": "application/json"},
                 timeout=None,  # ERP is slow — no timeout
             )
+            if response.status_code == 401:
+                schedule_erp_unauthorized_alert("GET", ERP_URL)
             response.raise_for_status()
             data = response.json()
             logger.info("[ERP] Fetched %d records.", len(data))

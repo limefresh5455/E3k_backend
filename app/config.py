@@ -18,6 +18,32 @@ def _read_bounded_int(name: str, default: int, minimum: int, maximum: int) -> in
     return value
 
 
+def _read_percentage_mapping(name: str) -> dict[str, float]:
+    """Read comma-separated ``code:percentage`` pairs from the environment."""
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return {}
+
+    result: dict[str, float] = {}
+    for item in raw_value.split(","):
+        code, separator, raw_percentage = item.partition(":")
+        code = code.strip()
+        if not separator or not code:
+            raise ValueError(f"{name} must contain code:percentage pairs")
+        try:
+            percentage = float(raw_percentage.strip())
+        except ValueError as error:
+            raise ValueError(
+                f"{name} contains an invalid percentage for code {code}"
+            ) from error
+        if not 0 <= percentage <= 100:
+            raise ValueError(
+                f"{name} percentage for code {code} must be between 0 and 100"
+            )
+        result[code] = percentage
+    return result
+
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PCLOUD_CODE = os.getenv("PCLOUD_CODE", "kZJYSGZ8TaSQch9Ivb9ov25SMaKfmHODDvy")
 PCLOUD_BASE_URL = os.getenv("PCLOUD_BASE_URL", "https://eapi.pcloud.com")
@@ -127,6 +153,36 @@ PCLOUD_TIMEOUT_SECONDS = int(os.getenv("PCLOUD_TIMEOUT_SECONDS", "60"))
 ERP_BASE_URL = os.getenv("ERP_BASE_URL", "https://e3k.teboag.ch:4433/e3k.Web")
 ERP_PASSWORD = os.getenv("ERP_PASSWORD")
 ERP_USERNAME = os.getenv("ERP_USERNAME")
+ERP_SALES_VAT_RATES = _read_percentage_mapping("ERP_SALES_VAT_RATES")
+ERP_AUTH_ALERT_RECIPIENTS = tuple(
+    address.strip()
+    for address in os.getenv("ERP_AUTH_ALERT_RECIPIENTS", "").split(",")
+    if address.strip()
+)
+ERP_AUTH_ALERT_COOLDOWN_HOURS = _read_bounded_int(
+    "ERP_AUTH_ALERT_COOLDOWN_HOURS", 24, 1, 168
+)
+ERP_AUTH_ALERT_SMTP_HOST = os.getenv("ERP_AUTH_ALERT_SMTP_HOST", "").strip()
+ERP_AUTH_ALERT_SMTP_PORT = _read_bounded_int(
+    "ERP_AUTH_ALERT_SMTP_PORT", 587, 1, 65535
+)
+ERP_AUTH_ALERT_SMTP_USERNAME = os.getenv(
+    "ERP_AUTH_ALERT_SMTP_USERNAME", ""
+).strip()
+ERP_AUTH_ALERT_SMTP_PASSWORD = os.getenv("ERP_AUTH_ALERT_SMTP_PASSWORD", "")
+ERP_AUTH_ALERT_FROM_EMAIL = os.getenv("ERP_AUTH_ALERT_FROM_EMAIL", "").strip()
+ERP_AUTH_ALERT_FROM_NAME = os.getenv(
+    "ERP_AUTH_ALERT_FROM_NAME", "E3K Monitoring System"
+).strip()
+ERP_AUTH_ALERT_SMTP_USE_TLS = (
+    os.getenv("ERP_AUTH_ALERT_SMTP_USE_TLS", "true").lower() == "true"
+)
+ERP_AUTH_ALERT_SMTP_USE_SSL = (
+    os.getenv("ERP_AUTH_ALERT_SMTP_USE_SSL", "false").lower() == "true"
+)
+ERP_AUTH_ALERT_SMTP_TIMEOUT_SECONDS = _read_bounded_int(
+    "ERP_AUTH_ALERT_SMTP_TIMEOUT_SECONDS", 15, 5, 60
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EMAIL_AUTOMATION_EXCEL_FILE = Path(

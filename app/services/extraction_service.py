@@ -6,7 +6,7 @@ import re
 import time
 import unicodedata
 from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import fitz  # PyMuPDF
 import pdfplumber
@@ -1240,21 +1240,14 @@ def _mcc_number(value: str) -> float | None:
 
 
 MCC_DEFAULT_DISCOUNT_PERCENT = Decimal("55")
-MCC_SALES_MULTIPLIER = Decimal("4")
-SWISS_VAT_MULTIPLIER = Decimal("1.081")
 
 
-def _round_up_to_ten_rappen(value: Decimal) -> Decimal:
-    """Round a positive amount upward to the next 0.10 boundary."""
-    return value.quantize(Decimal("0.1"), rounding=ROUND_CEILING)
-
-
-def _calculate_mcc_sales_prices(
+def _validate_mcc_purchase_price(
     gross_price: float,
     printed_net_price: float,
     discount_percent: float | None,
 ) -> dict | None:
-    """Validate an MCC purchase price and calculate its net/gross sale prices."""
+    """Validate an MCC purchase price without changing its printed value."""
     try:
         gross = Decimal(str(gross_price))
         printed_net = Decimal(str(printed_net_price))
@@ -1280,12 +1273,6 @@ def _calculate_mcc_sales_prices(
     if abs(printed_net - expected_net) > Decimal("0.02"):
         return None
 
-    # Keep the PDF's rounded net price as a cross-check, but calculate from the
-    # exact list-price/discount result as requested by the supplier rule.
-    sales_price_net = _round_up_to_ten_rappen(expected_net * MCC_SALES_MULTIPLIER)
-    sales_price_gross = _round_up_to_ten_rappen(
-        sales_price_net * SWISS_VAT_MULTIPLIER
-    )
     return {
         "discount_percent": float(effective_discount),
         "default_discount_applied": default_applied,
@@ -1293,9 +1280,11 @@ def _calculate_mcc_sales_prices(
             not default_applied
             and effective_discount != MCC_DEFAULT_DISCOUNT_PERCENT
         ),
-        "purchase_net_price": float(expected_net),
-        "sales_price_net": float(sales_price_net),
-        "sales_price_gross": float(sales_price_gross),
+        # The printed two-decimal price is authoritative for the client's
+        # sales-price formula. Keep the unrounded discounted value separately
+        # because MCC calculates some printed line totals from that value.
+        "purchase_net_price": float(printed_net),
+        "line_total_validation_unit_price": float(expected_net),
     }
 
 
@@ -1472,14 +1461,18 @@ def _extract_mcc_table_rows(pdf_bytes: bytes) -> list[dict]:
 
                 pricing = None
                 for discount in discount_candidates:
-                    pricing = _calculate_mcc_sales_prices(gross_price, net_price, discount)
+                    pricing = _validate_mcc_purchase_price(
+                        gross_price, net_price, discount
+                    )
                     if pricing is not None:
                         break
                 if pricing is None:
-                    pricing = _calculate_mcc_sales_prices(gross_price, net_price, None)
+                    pricing = _validate_mcc_purchase_price(
+                        gross_price, net_price, None
+                    )
                 if pricing is None or not _mcc_line_total_matches(
                     quantity,
-                    pricing["purchase_net_price"],
+                    pricing["line_total_validation_unit_price"],
                     line_total,
                 ):
                     continue
@@ -1631,9 +1624,6 @@ def _apply_mcc_table_validation(pdf_text: str, pdf_bytes: bytes, extracted: dict
             replacements["MccPosition"] = str(row["position"])
         if row_number == "VERSCH":
             replacements["MccSalesPriceExcluded"] = True
-        else:
-            replacements["MccSalesPriceNet"] = row["sales_price_net"]
-            replacements["MccSalesPriceGross"] = row["sales_price_gross"]
         if row["unit"]:
             replacements["DescriptionUnit"] = row["unit"]
 
