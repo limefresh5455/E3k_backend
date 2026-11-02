@@ -1,5 +1,5 @@
 from datetime import datetime
-from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_DOWN, ROUND_HALF_UP
 import logging
 import math
 import re
@@ -194,8 +194,10 @@ def _calculate_mcc_sales_prices(
 
 
 def _truncate_decimals(value: float, decimals: int = 2) -> float:
-    factor = 10 ** max(decimals, 0)
-    return math.trunc(value * factor) / factor
+    # Decimal avoids binary-float artefacts (e.g. 4.35 * 100 == 434.99999999999994)
+    # that would otherwise truncate a valid two-decimal price one cent too low.
+    quantum = Decimal(1).scaleb(-max(decimals, 0))
+    return float(Decimal(str(value)).quantize(quantum, rounding=ROUND_DOWN))
 
 
 def _effective_unit_price(pdf_line: dict) -> float:
@@ -222,6 +224,27 @@ def _effective_unit_price(pdf_line: dict) -> float:
     # if line_total_raw is not None and qty > 0:
     #     return round(_as_float(line_total_raw, default=0.0) / qty, 2)
     # return _as_float(pdf_line.get("GrossPrice", 0), default=0.0)
+
+
+def _discounted_purchase_price(
+    unit_price: float,
+    discount_percent: Optional[float],
+    discount_is_surcharge: bool = False,
+) -> tuple[float, Optional[float]]:
+    """
+    Return the (unit_price, discount_percent) pair to send to the ERP.
+
+    The ERP writes F016 into the article master data as the purchase price, so
+    F016 must already be the discounted price and no separate discount (F017)
+    may be applied on top of it. When there is no usable discount (or the
+    percentage is really a surcharge), the inputs are returned unchanged.
+    """
+    discount = _as_float(discount_percent, default=0.0)
+    if discount_is_surcharge or not 0 < discount < 100:
+        return unit_price, discount_percent
+
+    discounted = Decimal(str(unit_price)) * (Decimal(100) - Decimal(str(discount))) / Decimal(100)
+    return float(discounted.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)), 0.0
 
 
 def _resolve_surcharge_percent(pdf_line: dict, has_surcharge_column: bool = False) -> float:
@@ -997,13 +1020,18 @@ def push_manual_line_update(
     unit_price_f = _as_float(unit_price)
     line_total_f = _as_float(line_total)
 
+    # The ERP receives the discounted price and no separate discount.
+    erp_unit_price, erp_discount_percent = _discounted_purchase_price(
+        unit_price_f, discount_percent
+    )
+
     erp_line_id = _update_voucher_line(
         voucher_number_b=voucher_number_b,
         erp_article_number=article_number,
         delivery_date=formatted_delivery_date,
-        unit_price=unit_price_f,
+        unit_price=erp_unit_price,
         line_total=line_total_f,
-        discount_percent=discount_percent,
+        discount_percent=erp_discount_percent,
     )
 
     logger.info(
@@ -1255,13 +1283,25 @@ def push_to_erp(extracted: dict) -> dict:
             else supplier_sales_price_net
         )
 
+        # The ERP receives the discounted price and no separate discount, so the
+        # article master data gets the real purchase price. Surcharge lines keep
+        # their previous behaviour.
+        erp_unit_price, erp_discount_percent = _discounted_purchase_price(
+            unit_price,
+            pdf_line.get("DiscountPercent"),
+            discount_is_surcharge=_resolve_surcharge_percent(
+                pdf_line, has_surcharge_column=has_surcharge_column
+            )
+            > 0,
+        )
+
         updated_id = _update_voucher_line(
             voucher_number_b=voucher_number_b,
             erp_article_number=erp_article_number,
             delivery_date=delivery_date,
-            unit_price=unit_price,
+            unit_price=erp_unit_price,
             line_total=line_total,
-            discount_percent=pdf_line.get("DiscountPercent"),
+            discount_percent=erp_discount_percent,
             sales_price_net=voucher_line_sales_price_net,
         )
         updated_ids.append(updated_id)
