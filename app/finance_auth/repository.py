@@ -16,11 +16,16 @@ def normalize_email(email: str) -> str:
     return email.strip().casefold()
 
 
-def get_user_by_email(email: str) -> dict | None:
+def get_user_by_email(email: str, dashboard_access: str) -> dict | None:
     with closing(get_conn()) as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT * FROM finance_users WHERE LOWER(email) = %s",
-            (normalize_email(email),),
+            """
+            SELECT *
+              FROM finance_users
+             WHERE LOWER(email) = %s
+               AND dashboard_access = %s
+            """,
+            (normalize_email(email), dashboard_access),
         )
         row = cur.fetchone()
         return dict(row) if row else None
@@ -114,6 +119,7 @@ def rotate_refresh_session(
     family_id: UUID,
     current_digest: str,
     expected_token_version: int,
+    expected_role: str,
     new_jti: UUID,
     new_digest: str,
     new_expires_at: datetime,
@@ -126,7 +132,8 @@ def rotate_refresh_session(
             """
             SELECT s.jti, s.family_id, s.user_id, s.token_digest,
                    s.expires_at AS session_expires_at, s.revoked_at,
-                   u.email, u.role, u.is_active, u.token_version
+                   u.email, u.dashboard_access, u.role,
+                   u.is_active, u.token_version
               FROM finance_refresh_sessions s
               JOIN finance_users u ON u.id = s.user_id
              WHERE s.jti = %s
@@ -157,6 +164,8 @@ def rotate_refresh_session(
         if (
             row["session_expires_at"] <= now
             or not row["is_active"]
+            or row["dashboard_access"] != "finance"
+            or row["role"] != expected_role
             or int(row["token_version"]) != expected_token_version
         ):
             raise InvalidTokenError("Expired or inactive refresh session")
@@ -189,6 +198,7 @@ def rotate_refresh_session(
         return {
             "id": row["user_id"],
             "email": row["email"],
+            "dashboard_access": row["dashboard_access"],
             "role": row["role"],
             "is_active": row["is_active"],
             "token_version": row["token_version"],
@@ -254,12 +264,18 @@ def create_password_reset_challenge(
     hourly_cutoff: datetime,
     max_hourly_requests: int,
     requested_ip: str | None,
+    dashboard_access: str,
 ) -> tuple[dict, bool] | None:
     """Return (user, created); created=False means the request was throttled."""
     with closing(get_conn()) as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT * FROM finance_users WHERE LOWER(email) = %s FOR UPDATE",
-            (normalize_email(email),),
+            """
+            SELECT * FROM finance_users
+             WHERE LOWER(email) = %s
+               AND dashboard_access = %s
+             FOR UPDATE
+            """,
+            (normalize_email(email), dashboard_access),
         )
         user = cur.fetchone()
         if not user or not user["is_active"]:
@@ -315,19 +331,23 @@ def consume_password_reset_otp(
     otp: str,
     now: datetime,
     verify_digest: Callable[[UUID, str, str], bool],
+    dashboard_access: str,
 ) -> tuple[dict, UUID]:
     with closing(get_conn()) as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT c.*, u.email, u.role, u.is_active, u.token_version
+            SELECT c.*, u.email, u.dashboard_access, u.role,
+                   u.is_active, u.token_version
               FROM finance_password_reset_challenges c
               JOIN finance_users u ON u.id = c.user_id
-             WHERE LOWER(u.email) = %s AND c.consumed_at IS NULL
+             WHERE LOWER(u.email) = %s
+               AND u.dashboard_access = %s
+               AND c.consumed_at IS NULL
              ORDER BY c.created_at DESC
              LIMIT 1
              FOR UPDATE
             """,
-            (normalize_email(email),),
+            (normalize_email(email), dashboard_access),
         )
         row = cur.fetchone()
         if (
@@ -368,6 +388,7 @@ def consume_password_reset_otp(
             {
                 "id": row["user_id"],
                 "email": row["email"],
+                "dashboard_access": row["dashboard_access"],
                 "role": row["role"],
                 "is_active": row["is_active"],
                 "token_version": row["token_version"],
@@ -415,16 +436,22 @@ def reset_password(
         return updated
 
 
-def create_finance_user(email: str, password_hash: str, role: str) -> dict:
+def create_finance_user(
+    email: str,
+    password_hash: str,
+    role: str,
+    dashboard_access: str,
+) -> dict:
     try:
         with closing(get_conn()) as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO finance_users (email, password_hash, role)
-                VALUES (%s, %s, %s)
+                INSERT INTO finance_users
+                    (email, password_hash, role, dashboard_access)
+                VALUES (%s, %s, %s, %s)
                 RETURNING *
                 """,
-                (normalize_email(email), password_hash, role),
+                (normalize_email(email), password_hash, role, dashboard_access),
             )
             user = dict(cur.fetchone())
             conn.commit()
@@ -432,13 +459,16 @@ def create_finance_user(email: str, password_hash: str, role: str) -> dict:
     except psycopg2.IntegrityError as exc:
         if exc.pgcode == errorcodes.UNIQUE_VIOLATION:
             raise UserAlreadyExistsError(
-                "A Finanz-Cockpit user with this email already exists"
+                f"A {dashboard_access} dashboard user with this email already exists"
             ) from exc
         raise
 
 
 def update_finance_user_password(
-    email: str, password_hash: str, role: str | None = None
+    email: str,
+    password_hash: str,
+    role: str | None = None,
+    dashboard_access: str = "finance",
 ) -> dict | None:
     with closing(get_conn()) as conn, conn.cursor() as cur:
         cur.execute(
@@ -451,9 +481,10 @@ def update_finance_user_password(
                    locked_until = NULL,
                    updated_at = NOW()
              WHERE LOWER(email) = %s
+               AND dashboard_access = %s
             RETURNING *
             """,
-            (password_hash, role, normalize_email(email)),
+            (password_hash, role, normalize_email(email), dashboard_access),
         )
         row = cur.fetchone()
         if row:

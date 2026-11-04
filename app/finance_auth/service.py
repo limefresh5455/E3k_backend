@@ -39,13 +39,16 @@ def register_user(
     email: str,
     password: str,
     role: str,
+    dashboard_access: str,
     *,
     actor: dict,
     ip_address: str | None,
     user_agent: str | None,
 ) -> dict:
     password_hash = hash_password(password)
-    user = repository.create_finance_user(email, password_hash, role)
+    user = repository.create_finance_user(
+        email, password_hash, role, dashboard_access
+    )
     _audit(
         "user_registered",
         True,
@@ -54,7 +57,8 @@ def register_user(
         user_agent=user_agent,
     )
     logger.info(
-        "Finanz-Cockpit user registered by admin user_id=%s, new_user_id=%s",
+        "%s dashboard user registered by admin user_id=%s, new_user_id=%s",
+        dashboard_access,
         actor["id"],
         user["id"],
     )
@@ -87,12 +91,13 @@ def authenticate(
     *,
     ip_address: str | None,
     user_agent: str | None,
+    dashboard_access: str,
     issue_refresh_session: bool = True,
     access_token_minutes: int | None = None,
 ) -> AuthTokens:
     validate_finance_auth_configuration()
     now = utc_now()
-    user = repository.get_user_by_email(email)
+    user = repository.get_user_by_email(email, dashboard_access)
     if not user:
         verify_dummy_password(password)
         _audit(
@@ -130,6 +135,8 @@ def authenticate(
     access = issue_access_token(user, expires_minutes=access_token_minutes)
     refresh = None
     if issue_refresh_session:
+        if dashboard_access != "finance":
+            raise ValueError("Refresh sessions are only supported for finance accounts")
         refresh = issue_refresh_token(user)
         repository.create_refresh_session(
             jti=refresh.jti,
@@ -156,12 +163,17 @@ def refresh_tokens(
     ip_address: str | None,
     user_agent: str | None,
 ) -> AuthTokens:
-    payload = decode_token(refresh_token, "refresh")
+    payload = decode_token(
+        refresh_token,
+        "refresh",
+        expected_dashboard_access="finance",
+    )
     family_id = UUID(str(payload["sid"]))
     replacement = issue_refresh_token(
         {
             "id": int(payload["sub"]),
             "email": payload["email"],
+            "dashboard_access": payload["dashboard_access"],
             "role": payload["role"],
             "token_version": int(payload["tv"]),
         },
@@ -173,6 +185,7 @@ def refresh_tokens(
         family_id=family_id,
         current_digest=token_digest(refresh_token),
         expected_token_version=int(payload["tv"]),
+        expected_role=str(payload["role"]),
         new_jti=replacement.jti,
         new_digest=token_digest(replacement.value),
         new_expires_at=replacement.expires_at,
@@ -200,7 +213,11 @@ def logout(
     user_id = None
     if refresh_token:
         try:
-            payload = decode_token(refresh_token, "refresh")
+            payload = decode_token(
+                refresh_token,
+                "refresh",
+                expected_dashboard_access="finance",
+            )
             user_id = int(payload["sub"])
             repository.revoke_refresh_session(
                 UUID(str(payload["jti"])), token_digest(refresh_token), utc_now()
@@ -248,6 +265,7 @@ def request_password_reset(
         hourly_cutoff=now - timedelta(hours=1),
         max_hourly_requests=config.FINANCE_OTP_MAX_REQUESTS_PER_HOUR,
         requested_ip=ip_address,
+        dashboard_access="finance",
     )
     user = result[0] if result else None
     created = bool(result and result[1])
@@ -278,6 +296,7 @@ def verify_password_reset_otp(
             otp=otp,
             now=utc_now(),
             verify_digest=verify_otp_digest,
+            dashboard_access="finance",
         )
         user_id = user["id"]
         token = issue_password_reset_token(user, challenge_id)
@@ -307,7 +326,11 @@ def reset_password(
     ip_address: str | None,
     user_agent: str | None,
 ) -> None:
-    payload = decode_token(reset_token, "password_reset")
+    payload = decode_token(
+        reset_token,
+        "password_reset",
+        expected_dashboard_access="finance",
+    )
     password_hash = hash_password(new_password)
     user = repository.reset_password(
         user_id=int(payload["sub"]),
@@ -324,13 +347,25 @@ def reset_password(
     )
 
 
-def authenticated_user_from_access_token(access_token: str) -> dict:
-    payload = decode_token(access_token, "access")
+def authenticated_user_from_access_token(
+    access_token: str,
+    *,
+    expected_dashboard_access: str,
+) -> dict:
+    payload = decode_token(
+        access_token,
+        "access",
+        expected_dashboard_access=expected_dashboard_access,
+    )
     user = repository.get_user_by_id(int(payload["sub"]))
     if (
         not user
         or not user["is_active"]
-        or user["role"] not in {"finance_user", "finance_admin"}
+        or user["dashboard_access"] != expected_dashboard_access
+        or user["dashboard_access"] != payload["dashboard_access"]
+        or user["role"] not in {"admin", "user"}
+        or user["role"] != payload["role"]
+        or user["email"] != payload["email"]
         or int(user["token_version"]) != int(payload["tv"])
     ):
         raise InvalidTokenError("Invalid or expired token")

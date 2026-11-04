@@ -91,7 +91,10 @@ def require_dashboard_principal(
             headers={"WWW-Authenticate": "Bearer"},
         )
     try:
-        user = authenticated_user_from_access_token(credentials.credentials)
+        user = authenticated_user_from_access_token(
+            credentials.credentials,
+            expected_dashboard_access="worker",
+        )
         principal = principal_for_user(user)
     except FinanceAuthConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

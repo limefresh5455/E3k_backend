@@ -17,7 +17,10 @@ def require_finance_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     try:
-        return authenticated_user_from_access_token(credentials.credentials)
+        return authenticated_user_from_access_token(
+            credentials.credentials,
+            expected_dashboard_access="finance",
+        )
     except FinanceAuthConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except InvalidTokenError as exc:
@@ -29,7 +32,7 @@ def require_finance_user(
 
 
 def require_finance_admin(user: dict = Depends(require_finance_user)) -> dict:
-    if user["role"] != "finance_admin":
+    if user["role"] != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Finanz-Cockpit administrator access required",

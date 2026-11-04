@@ -30,9 +30,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--email", default="r.kurmann@tebo.ag")
     parser.add_argument(
         "--role",
-        choices=("finance_user", "finance_admin"),
-        default="finance_admin",
-        help="Bootstrap role (default: finance_admin, required to register users)",
+        choices=("user", "admin"),
+        default="admin",
+        help="Bootstrap role (default: admin, required to register users)",
     )
     parser.add_argument(
         "--update-existing",
@@ -51,7 +51,7 @@ def main() -> int:
         return 2
 
     init_finance_auth_db()
-    existing = repository.get_user_by_email(email)
+    existing = repository.get_user_by_email(email, "finance")
     if existing and not args.update_existing:
         print(
             "User already exists. Use --update-existing to deliberately reset its password.",
@@ -72,12 +72,14 @@ def main() -> int:
         return 2
 
     if existing:
-        repository.update_finance_user_password(email, password_hash, args.role)
+        repository.update_finance_user_password(
+            email, password_hash, args.role, "finance"
+        )
         print(
             f"Updated {email} as {args.role} and revoked its existing sessions."
         )
     else:
-        repository.create_finance_user(email, password_hash, args.role)
+        repository.create_finance_user(email, password_hash, args.role, "finance")
         print(f"Created {args.role} account for {email}.")
     return 0
 

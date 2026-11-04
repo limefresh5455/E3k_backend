@@ -94,6 +94,22 @@ def validate_finance_auth_configuration() -> None:
         raise FinanceAuthConfigurationError(
             "Finanz JWT secrets and OTP pepper must use three different values"
         )
+    if (
+        not config.FINANCE_JWT_AUDIENCE.strip()
+        or not config.WORKER_DASHBOARD_JWT_AUDIENCE.strip()
+        or config.FINANCE_JWT_AUDIENCE == config.WORKER_DASHBOARD_JWT_AUDIENCE
+    ):
+        raise FinanceAuthConfigurationError(
+            "Finance and worker dashboard JWT audiences must be non-empty and different"
+        )
+
+
+def _audience_for_dashboard(dashboard_access: str) -> str:
+    if dashboard_access == "finance":
+        return config.FINANCE_JWT_AUDIENCE
+    if dashboard_access == "worker":
+        return config.WORKER_DASHBOARD_JWT_AUDIENCE
+    raise FinanceAuthConfigurationError("Unsupported dashboard access")
 
 
 def _base_claims(user: dict, token_type: str, jti: UUID, expires_at: datetime) -> dict:
@@ -102,11 +118,12 @@ def _base_claims(user: dict, token_type: str, jti: UUID, expires_at: datetime) -
         "sub": str(user["id"]),
         "email": user["email"],
         "role": user["role"],
+        "dashboard_access": user["dashboard_access"],
         "type": token_type,
         "jti": str(jti),
         "tv": int(user["token_version"]),
         "iss": config.FINANCE_JWT_ISSUER,
-        "aud": config.FINANCE_JWT_AUDIENCE,
+        "aud": _audience_for_dashboard(user["dashboard_access"]),
         "iat": now,
         "nbf": now,
         "exp": expires_at,
@@ -174,7 +191,12 @@ def issue_password_reset_token(user: dict, challenge_id: UUID) -> IssuedToken:
     return IssuedToken(value=value, jti=jti, expires_at=expires_at)
 
 
-def decode_token(token: str, expected_type: str) -> dict:
+def decode_token(
+    token: str,
+    expected_type: str,
+    *,
+    expected_dashboard_access: str,
+) -> dict:
     if expected_type == "refresh":
         secret = _require_secret(
             config.FINANCE_JWT_REFRESH_SECRET, "FINANCE_JWT_REFRESH_SECRET"
@@ -183,6 +205,7 @@ def decode_token(token: str, expected_type: str) -> dict:
             "sub",
             "email",
             "role",
+            "dashboard_access",
             "type",
             "jti",
             "sid",
@@ -199,6 +222,7 @@ def decode_token(token: str, expected_type: str) -> dict:
             "sub",
             "email",
             "role",
+            "dashboard_access",
             "type",
             "jti",
             "tv",
@@ -215,7 +239,7 @@ def decode_token(token: str, expected_type: str) -> dict:
             secret,
             algorithms=[config.FINANCE_JWT_ALGORITHM],
             issuer=config.FINANCE_JWT_ISSUER,
-            audience=config.FINANCE_JWT_AUDIENCE,
+            audience=_audience_for_dashboard(expected_dashboard_access),
             options={"require": required_claims},
         )
     except jwt.PyJWTError as exc:
@@ -223,8 +247,10 @@ def decode_token(token: str, expected_type: str) -> dict:
 
     if payload.get("type") != expected_type:
         raise InvalidTokenError("Invalid token type")
-    if payload.get("role") not in {"finance_user", "finance_admin"}:
-        raise InvalidTokenError("Invalid finance role")
+    if payload.get("dashboard_access") != expected_dashboard_access:
+        raise InvalidTokenError("Invalid dashboard access")
+    if payload.get("role") not in {"admin", "user"}:
+        raise InvalidTokenError("Invalid dashboard role")
     try:
         int(payload["sub"])
         int(payload["tv"])

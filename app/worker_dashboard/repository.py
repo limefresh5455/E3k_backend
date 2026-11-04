@@ -42,9 +42,29 @@ def replace_user_access(
         raise ValueError("display_name must not be empty")
     _validate_entitlements(entitlements)
     with closing(get_conn()) as conn, conn.cursor() as cur:
-        cur.execute("SELECT id FROM finance_users WHERE id = %s FOR UPDATE", (user_id,))
-        if not cur.fetchone():
-            raise ValueError("user does not exist")
+        cur.execute(
+            """
+            SELECT id, role FROM finance_users
+             WHERE id = %s AND dashboard_access = 'worker'
+             FOR UPDATE
+            """,
+            (user_id,),
+        )
+        user = cur.fetchone()
+        if not user:
+            raise ValueError("worker dashboard user does not exist")
+        role = "admin" if (USERS_MANAGE, GLOBAL_SCOPE) in entitlements else "user"
+        if user["role"] != role:
+            cur.execute(
+                """
+                UPDATE finance_users
+                   SET role = %s,
+                       token_version = token_version + 1,
+                       updated_at = NOW()
+                 WHERE id = %s
+                """,
+                (role, user_id),
+            )
         cur.execute(
             """
             INSERT INTO dashboard_user_profiles (user_id, display_name)
@@ -86,6 +106,7 @@ def list_dashboard_users() -> list[dict]:
               FROM finance_users u
               LEFT JOIN dashboard_user_profiles p ON p.user_id = u.id
               LEFT JOIN dashboard_entitlements e ON e.user_id = u.id
+             WHERE u.dashboard_access = 'worker'
              GROUP BY u.id, p.display_name
              ORDER BY LOWER(u.email)
             """
@@ -102,6 +123,7 @@ def set_user_active(user_id: int, active: bool) -> bool:
                    token_version = token_version + 1,
                    updated_at = NOW()
              WHERE id = %s
+               AND dashboard_access = 'worker'
             RETURNING id
             """,
             (active, user_id),

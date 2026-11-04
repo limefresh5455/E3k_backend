@@ -58,7 +58,7 @@ def main() -> int:
 
     init_finance_auth_db()
     init_worker_dashboard_db()
-    user = auth_repository.get_user_by_email(args.email)
+    user = auth_repository.get_user_by_email(args.email, "worker")
     if not user:
         if not args.create:
             parser.error("user does not exist; add --create to create it")
@@ -68,14 +68,15 @@ def main() -> int:
             parser.error("passwords do not match")
         entitlements = set(args.permission)
         role = (
-            "finance_admin"
+            "admin"
             if (USERS_MANAGE, GLOBAL_SCOPE) in entitlements
-            else "finance_user"
+            else "user"
         )
         user = auth_repository.create_finance_user(
             args.email,
             hash_password(password),
             role,
+            "worker",
         )
 
     replace_user_access(

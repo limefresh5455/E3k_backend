@@ -76,6 +76,7 @@ def _authenticate(
             body.password,
             ip_address=ip_address,
             user_agent=user_agent,
+            dashboard_access="worker",
             issue_refresh_session=False,
             access_token_minutes=app_config.WORKER_DASHBOARD_ACCESS_TOKEN_MINUTES,
         )

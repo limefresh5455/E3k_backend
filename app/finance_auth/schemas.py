@@ -11,7 +11,7 @@ class FinanceLoginRequest(BaseModel):
 class RegisterFinanceUserRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=12, max_length=128)
-    role: Literal["finance_user", "finance_admin"] = "finance_user"
+    role: Literal["user", "admin"] = "user"
 
     @field_validator("password")
     @classmethod
@@ -27,6 +27,7 @@ class FinanceUserResponse(BaseModel):
     id: int
     email: EmailStr
     role: str
+    dashboard_access: Literal["finance"] = "finance"
 
 
 class FinanceTokenResponse(BaseModel):

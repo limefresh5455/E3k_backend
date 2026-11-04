@@ -57,6 +57,7 @@ def register(
             str(body.email),
             body.password,
             body.role,
+            "finance",
             actor=admin,
             ip_address=ip_address,
             user_agent=user_agent,
@@ -65,7 +66,12 @@ def register(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except UserAlreadyExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return FinanceUserResponse(id=user["id"], email=user["email"], role=user["role"])
+    return FinanceUserResponse(
+        id=user["id"],
+        email=user["email"],
+        role=user["role"],
+        dashboard_access="finance",
+    )
 
 
 def _request_metadata(request: Request) -> tuple[str | None, str | None]:
@@ -122,6 +128,7 @@ def _token_response(tokens: service.AuthTokens) -> FinanceTokenResponse:
             id=tokens.user["id"],
             email=tokens.user["email"],
             role=tokens.user["role"],
+            dashboard_access="finance",
         ),
     )
 
@@ -142,6 +149,7 @@ def login(body: FinanceLoginRequest, request: Request, response: Response):
             body.password,
             ip_address=ip_address,
             user_agent=user_agent,
+            dashboard_access="finance",
         )
         _set_refresh_cookie(response, _refresh_value(tokens))
         return _token_response(tokens)
@@ -183,7 +191,12 @@ def refresh(request: Request, response: Response):
 
 @router.get("/me", response_model=FinanceUserResponse)
 def me(user: dict = Depends(require_finance_user)):
-    return FinanceUserResponse(id=user["id"], email=user["email"], role=user["role"])
+    return FinanceUserResponse(
+        id=user["id"],
+        email=user["email"],
+        role=user["role"],
+        dashboard_access="finance",
+    )
 
 
 @router.post("/logout", response_model=MessageResponse)

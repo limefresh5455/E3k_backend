@@ -78,9 +78,9 @@ def create_user(
 ):
     entitlements = _pairs(body.entitlements)
     underlying_role = (
-        "finance_admin"
+        "admin"
         if (USERS_MANAGE, "*") in entitlements
-        else "finance_user"
+        else "user"
     )
     ip_address = request.client.host if request.client else None
     try:
@@ -88,6 +88,7 @@ def create_user(
             str(body.email),
             body.password,
             underlying_role,
+            "worker",
             actor={"id": admin.id},
             ip_address=ip_address,
             user_agent=request.headers.get("user-agent", "")[:512] or None,
@@ -126,7 +127,7 @@ def update_user(
     admin: DashboardPrincipal = Depends(require_dashboard_admin),
 ):
     user = auth_repository.get_user_by_id(user_id)
-    if not user:
+    if not user or user["dashboard_access"] != "worker":
         raise HTTPException(status_code=404, detail="Dashboard user not found")
     entitlements = _pairs(body.entitlements)
     if user_id == admin.id and (USERS_MANAGE, "*") not in entitlements:
