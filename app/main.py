@@ -20,6 +20,9 @@ from app.config import (
 from app.db import init_db
 from app.finance_auth.database import init_finance_auth_db
 from app.supplier_addresses.database import init_supplier_address_db
+from app.worker_dashboard.config import DashboardSettings
+from app.worker_dashboard.database import init_worker_dashboard_db
+from app.worker_dashboard.publisher import DashboardPublisher
 
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -106,12 +109,17 @@ def _add_email_automation_jobs(scheduler, timezone):
 async def lifespan(app: FastAPI):
     init_db()
     init_finance_auth_db()
+    init_worker_dashboard_db()
     init_supplier_address_db()
     if EMAIL_AUTOMATION_ENABLED:
         from app.email_automation.database import init_email_automation_db
 
         init_email_automation_db()
     scheduler = None
+    dashboard_settings = DashboardSettings.from_env()
+    dashboard_settings.validate()
+    dashboard_publisher = DashboardPublisher(dashboard_settings)
+    dashboard_publisher.start()
 
     if ENABLE_SCHEDULER and not APSCHEDULER_AVAILABLE:
         logger.warning(
@@ -194,11 +202,13 @@ async def lifespan(app: FastAPI):
                     email_next_run.strftime("%Y-%m-%d %H:%M:%S %Z"),
                 )
 
-    yield
-
-    if scheduler:
-        scheduler.shutdown(wait=False)
-        logger.info("[SCHEDULER] Shutdown.")
+    try:
+        yield
+    finally:
+        if scheduler:
+            scheduler.shutdown(wait=False)
+            logger.info("[SCHEDULER] Shutdown.")
+        dashboard_publisher.stop()
 
 app = FastAPI(title=API_TITLE, version=API_VERSION, lifespan=lifespan)
 

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": "1.0",
+  "audience": "finance",
+  "isSample": true,
+  "company": {"id": "ssb", "name": "Schlauchservice Baumann GmbH", "clientId": "000", "fiscalYearStartMonth": 1},
+  "source": {"asOf": "2026-10-29T08:00:00Z", "exportedAt": "2026-10-29T08:01:00Z", "historyFrom": "2024-01-01", "status": "sample-only"},
+  "currency": "CHF",
+  "amountUnit": "integer-cents",
+  "monthlyResults": [
+    {"period": "2026-09", "netRevenueCents": 6000000, "materialExpenseCents": 2700000, "grossProfitCents": 3300000, "personnelExpenseCents": 1800000, "otherOperatingExpenseCents": 1100000, "operatingProfitCents": 400000, "directTaxCents": 60000, "netProfitCents": 340000, "coverage": "complete-demo-month"}
+  ],
+  "cash": {"asOf": "2026-10-29T08:00:00Z", "basis": "book-balance", "accounts": [{"id": "S-DEMO-CASH", "label": "Fictitious CHF account", "currency": "CHF", "balanceCents": 1700000, "includeInLiquidity": true}], "confirmed": false},
+  "receivables": [
+    {"id": "S-AR01", "documentNumber": "DEMO-AR-001", "counterparty": "Fictitious customer", "issueDate": "2026-10-01", "dueDate": "2026-10-31", "currency": "CHF", "originalAmountCents": 108100, "outstandingAmountCents": 108100, "status": "open", "paidDate": null},
+    {"id": "S-AR02", "documentNumber": "DEMO-AR-002", "counterparty": "Fictitious customer", "issueDate": "2026-09-01", "dueDate": "2026-10-01", "currency": "CHF", "originalAmountCents": 216200, "outstandingAmountCents": 0, "status": "paid", "paidDate": "2026-09-21"}
+  ],
+  "payables": [{"id": "S-AP01", "documentNumber": "DEMO-AP-001", "counterparty": "Fictitious supplier", "issueDate": "2026-10-10", "dueDate": "2026-11-09", "currency": "CHF", "originalAmountCents": 54050, "outstandingAmountCents": 54050, "status": "open", "paidDate": null}],
+  "inventoryValuation": {"status": "not-approved", "valueCents": null, "reason": "Synthetic example; no production valuation is asserted."}
+}

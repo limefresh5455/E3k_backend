@@ -113,12 +113,21 @@ def _base_claims(user: dict, token_type: str, jti: UUID, expires_at: datetime) -
     }
 
 
-def issue_access_token(user: dict) -> IssuedToken:
+def issue_access_token(
+    user: dict, *, expires_minutes: int | None = None
+) -> IssuedToken:
     secret = _require_secret(
         config.FINANCE_JWT_ACCESS_SECRET, "FINANCE_JWT_ACCESS_SECRET"
     )
     jti = uuid4()
-    expires_at = utc_now() + timedelta(minutes=config.FINANCE_ACCESS_TOKEN_MINUTES)
+    lifetime_minutes = (
+        config.FINANCE_ACCESS_TOKEN_MINUTES
+        if expires_minutes is None
+        else expires_minutes
+    )
+    if lifetime_minutes <= 0:
+        raise ValueError("Access-token lifetime must be greater than zero")
+    expires_at = utc_now() + timedelta(minutes=lifetime_minutes)
     value = jwt.encode(
         _base_claims(user, "access", jti, expires_at),
         secret,

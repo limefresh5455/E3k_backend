@@ -31,7 +31,7 @@ logger = logging.getLogger("finance_auth.service")
 @dataclass(frozen=True)
 class AuthTokens:
     access: IssuedToken
-    refresh: IssuedToken
+    refresh: IssuedToken | None
     user: dict
 
 
@@ -87,6 +87,8 @@ def authenticate(
     *,
     ip_address: str | None,
     user_agent: str | None,
+    issue_refresh_session: bool = True,
+    access_token_minutes: int | None = None,
 ) -> AuthTokens:
     validate_finance_auth_configuration()
     now = utc_now()
@@ -125,17 +127,19 @@ def authenticate(
     repository.register_successful_login(user["id"], now)
     user["failed_login_attempts"] = 0
     user["locked_until"] = None
-    access = issue_access_token(user)
-    refresh = issue_refresh_token(user)
-    repository.create_refresh_session(
-        jti=refresh.jti,
-        family_id=refresh.family_id or refresh.jti,
-        user_id=user["id"],
-        token_digest=token_digest(refresh.value),
-        expires_at=refresh.expires_at,
-        ip_address=ip_address,
-        user_agent=user_agent,
-    )
+    access = issue_access_token(user, expires_minutes=access_token_minutes)
+    refresh = None
+    if issue_refresh_session:
+        refresh = issue_refresh_token(user)
+        repository.create_refresh_session(
+            jti=refresh.jti,
+            family_id=refresh.family_id or refresh.jti,
+            user_id=user["id"],
+            token_digest=token_digest(refresh.value),
+            expires_at=refresh.expires_at,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
     _audit(
         "login",
         True,

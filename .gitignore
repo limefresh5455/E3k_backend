@@ -17,4 +17,7 @@ data/supplier address notebook.xlsx.lock
 logs/email_automation.log
 logs/email_automation_saved_paths.txt
 
+# Worker Dashboard SFTP staging, published datasets, and release archives
+data/worker_dashboard/
+
 

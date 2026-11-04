@@ -324,6 +324,12 @@ def _uses_low_price_sales_rule(supplier: object) -> bool:
     )
 
 
+def _uses_jubilee_pricing_unit(supplier: object) -> bool:
+    """Jubilee's numeric ``Per`` column is a genuine price-unit factor."""
+    normalized = str(supplier or "").strip().casefold()
+    return re.search(r"\bjubilee\s+clips\b", normalized) is not None
+
+
 def _calculate_low_price_sales_price(
     published_price: float,
     purchase_price: float,
@@ -460,6 +466,24 @@ def _resolve_unit_price_and_factor(pdf_line: dict, base_unit_price: float) -> tu
     if factor_equals_quantity:
         return candidate_plain, 1.0, "no_line_total_defaulted_by_quantity_match"
     return candidate_divided, unit_factor, "no_line_total_unverified"
+
+
+def _resolve_jubilee_unit_price_and_factor(
+    pdf_line: dict, base_unit_price: float
+) -> tuple[float, float, str]:
+    """Resolve Jubilee's ``Per`` price factor without changing other suppliers."""
+    jubilee_line = dict(pdf_line)
+    if jubilee_line.get("Per") is not None:
+        jubilee_line["PricingUnitFactor"] = jubilee_line["Per"]
+
+    unit_price, unit_factor, reason = _resolve_unit_price_and_factor(
+        jubilee_line, base_unit_price
+    )
+    if unit_factor != 1.0:
+        # Preserve the exact per-piece conversion until the existing ERP field
+        # formatter applies its required precision.
+        unit_price = base_unit_price / unit_factor
+    return unit_price, unit_factor, reason
 
 
 def _normalize_article(value: str) -> str:
@@ -1106,6 +1130,7 @@ def push_to_erp(extracted: dict) -> dict:
     updated_count = 0
     is_mcc_order = bool(extracted.get("IsMccOrderConfirmation"))
     uses_low_price_sales_rule = _uses_low_price_sales_rule(extracted.get("Supplier"))
+    uses_jubilee_pricing_unit = _uses_jubilee_pricing_unit(extracted.get("Supplier"))
     has_surcharge_column = bool(extracted.get("HasSurchargeColumn"))
     order_date_dt = None
     order_date_raw = extracted.get("OrderDate") or extracted.get("VoucherDate")
@@ -1153,11 +1178,14 @@ def push_to_erp(extracted: dict) -> dict:
         unit_factor = 1.0
         unit_price_resolution = "direct_gross_price"
 
-        # Previous logic reconciled/divided the price using Einheit and the
-        # printed line total before sending it to F016.
-        # unit_price, unit_factor, unit_price_resolution = _resolve_unit_price_and_factor(
-        #     pdf_line, base_unit_price
-        # )
+        # Jubilee's "Per" column is a pricing factor: e.g. GBP 88.39 per 100
+        # means a purchase price of GBP 0.8839 per piece. Keep the generic
+        # factor logic supplier-scoped because other suppliers use Einheit for
+        # pack metadata that must not alter their ERP purchase price.
+        if uses_jubilee_pricing_unit:
+            unit_price, unit_factor, unit_price_resolution = (
+                _resolve_jubilee_unit_price_and_factor(pdf_line, base_unit_price)
+            )
         erp_quantity = _as_float(matched.get("Quantity", 0), default=0.0)
         extracted_quantity = _as_float(pdf_line.get("Quantity", 0), default=0.0)
         qty_for_total = erp_quantity if erp_quantity > 0 else extracted_quantity

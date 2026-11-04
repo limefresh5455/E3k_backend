@@ -1,0 +1,34 @@
+{
+  "schemaVersion": "1.0",
+  "audience": "worker",
+  "isSample": true,
+  "company": {"id": "ssb", "name": "Schlauchservice Baumann GmbH", "clientId": "000", "fiscalYearStartMonth": 1},
+  "source": {"asOf": "2026-10-29T08:00:00Z", "exportedAt": "2026-10-29T08:01:00Z", "historyFrom": "2024-01-01", "status": "sample-only"},
+  "customers": [
+    {"id": "S-C01", "code": "S-DEMO-001", "name": "Demo Customer One"},
+    {"id": "S-C02", "code": "S-DEMO-002", "name": "Demo Customer Two"}
+  ],
+  "articles": [
+    {"id": "S-A01", "code": "S-100001", "name": "Demo hose DN 25", "productGroup": "Hoses", "unit": "m", "currentStock": 120, "minStock": 50, "orderedQty": 40, "reservedQty": 15},
+    {"id": "S-A02", "code": "S-100002", "name": "Demo coupling DN 25", "productGroup": "Couplings", "unit": "pcs", "currentStock": 8, "minStock": 10, "orderedQty": 20, "reservedQty": 3}
+  ],
+  "salesQuantities": [
+    {"date": "2024-10-15", "articleId": "S-A01", "customerId": "S-C01", "quantity": 24, "unit": "m", "documentId": null},
+    {"date": "2024-10-16", "articleId": "S-A02", "customerId": "S-C02", "quantity": 6, "unit": "pcs", "documentId": null},
+    {"date": "2025-10-15", "articleId": "S-A01", "customerId": "S-C01", "quantity": 36, "unit": "m", "documentId": null},
+    {"date": "2025-10-16", "articleId": "S-A02", "customerId": "S-C02", "quantity": 9, "unit": "pcs", "documentId": null},
+    {"date": "2026-10-15", "articleId": "S-A01", "customerId": "S-C01", "quantity": 48, "unit": "m", "documentId": "S-D05"},
+    {"date": "2026-10-16", "articleId": "S-A02", "customerId": "S-C02", "quantity": 12, "unit": "pcs", "documentId": null}
+  ],
+  "documents": [
+    {"id": "S-D01", "type": "quotation", "number": "DEMO-Q-260001", "date": "2026-10-28", "customerId": "S-C01", "status": "open", "pdfUrl": null},
+    {"id": "S-D02", "type": "order", "number": "DEMO-O-260002", "date": "2026-10-27", "customerId": "S-C01", "status": "open", "pdfUrl": null},
+    {"id": "S-D03", "type": "delivery_note", "number": "DEMO-D-260003", "date": "2026-10-26", "customerId": "S-C02", "status": "completed", "pdfUrl": null},
+    {"id": "S-D04", "type": "proforma", "number": "DEMO-P-260004", "date": "2026-10-25", "customerId": "S-C02", "status": "open", "pdfUrl": null},
+    {"id": "S-D05", "type": "invoice", "number": "DEMO-I-260005", "date": "2026-10-24", "customerId": "S-C01", "status": "issued", "pdfUrl": null}
+  ],
+  "warehouseMovements": [
+    {"id": "S-M01", "date": "2026-10-26", "articleId": "S-A01", "warehouse": "DEMO-WH", "inQty": 0, "outQty": 12, "unit": "m", "documentId": "S-D03"},
+    {"id": "S-M02", "date": "2026-10-20", "articleId": "S-A02", "warehouse": "DEMO-WH", "inQty": 20, "outQty": 0, "unit": "pcs", "documentId": null}
+  ]
+}

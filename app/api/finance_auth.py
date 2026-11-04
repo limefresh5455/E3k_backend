@@ -126,6 +126,13 @@ def _token_response(tokens: service.AuthTokens) -> FinanceTokenResponse:
     )
 
 
+def _refresh_value(tokens: service.AuthTokens) -> str:
+    """Return the refresh token required by the Finance cookie flow."""
+    if tokens.refresh is None:
+        raise FinanceAuthConfigurationError("Finance refresh token was not issued")
+    return tokens.refresh.value
+
+
 @router.post("/login", response_model=FinanceTokenResponse)
 def login(body: FinanceLoginRequest, request: Request, response: Response):
     ip_address, user_agent = _request_metadata(request)
@@ -136,7 +143,7 @@ def login(body: FinanceLoginRequest, request: Request, response: Response):
             ip_address=ip_address,
             user_agent=user_agent,
         )
-        _set_refresh_cookie(response, tokens.refresh.value)
+        _set_refresh_cookie(response, _refresh_value(tokens))
         return _token_response(tokens)
     except FinanceAuthConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -161,7 +168,7 @@ def refresh(request: Request, response: Response):
             ip_address=ip_address,
             user_agent=user_agent,
         )
-        _set_refresh_cookie(response, tokens.refresh.value)
+        _set_refresh_cookie(response, _refresh_value(tokens))
         return _token_response(tokens)
     except FinanceAuthConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

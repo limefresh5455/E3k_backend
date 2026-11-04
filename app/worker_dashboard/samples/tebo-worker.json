@@ -1,0 +1,36 @@
+{
+  "schemaVersion": "1.0",
+  "audience": "worker",
+  "isSample": true,
+  "company": {"id": "tebo", "name": "Tebo AG", "clientId": "001", "fiscalYearStartMonth": 7},
+  "source": {"asOf": "2026-10-29T08:00:00Z", "exportedAt": "2026-10-29T08:01:00Z", "historyFrom": "2023-01-01", "status": "sample-only"},
+  "customers": [
+    {"id": "T-C01", "code": "T-DEMO-001", "name": "Demo Customer One"},
+    {"id": "T-C02", "code": "T-DEMO-002", "name": "Demo Customer Two"}
+  ],
+  "articles": [
+    {"id": "T-A01", "code": "T-100001", "name": "Demo hose DN 25", "productGroup": "Hoses", "unit": "m", "currentStock": 120, "minStock": 50, "orderedQty": 40, "reservedQty": 15},
+    {"id": "T-A02", "code": "T-100002", "name": "Demo coupling DN 25", "productGroup": "Couplings", "unit": "pcs", "currentStock": 8, "minStock": 10, "orderedQty": 20, "reservedQty": 3}
+  ],
+  "salesQuantities": [
+    {"date": "2023-10-15", "articleId": "T-A01", "customerId": "T-C01", "quantity": 12, "unit": "m", "documentId": null},
+    {"date": "2023-10-16", "articleId": "T-A02", "customerId": "T-C02", "quantity": 3, "unit": "pcs", "documentId": null},
+    {"date": "2024-10-15", "articleId": "T-A01", "customerId": "T-C01", "quantity": 24, "unit": "m", "documentId": null},
+    {"date": "2024-10-16", "articleId": "T-A02", "customerId": "T-C02", "quantity": 6, "unit": "pcs", "documentId": null},
+    {"date": "2025-10-15", "articleId": "T-A01", "customerId": "T-C01", "quantity": 36, "unit": "m", "documentId": null},
+    {"date": "2025-10-16", "articleId": "T-A02", "customerId": "T-C02", "quantity": 9, "unit": "pcs", "documentId": null},
+    {"date": "2026-10-15", "articleId": "T-A01", "customerId": "T-C01", "quantity": 48, "unit": "m", "documentId": "T-D05"},
+    {"date": "2026-10-16", "articleId": "T-A02", "customerId": "T-C02", "quantity": 12, "unit": "pcs", "documentId": null}
+  ],
+  "documents": [
+    {"id": "T-D01", "type": "quotation", "number": "DEMO-Q-260001", "date": "2026-10-28", "customerId": "T-C01", "status": "open", "pdfUrl": null},
+    {"id": "T-D02", "type": "order", "number": "DEMO-O-260002", "date": "2026-10-27", "customerId": "T-C01", "status": "open", "pdfUrl": null},
+    {"id": "T-D03", "type": "delivery_note", "number": "DEMO-D-260003", "date": "2026-10-26", "customerId": "T-C02", "status": "completed", "pdfUrl": null},
+    {"id": "T-D04", "type": "proforma", "number": "DEMO-P-260004", "date": "2026-10-25", "customerId": "T-C02", "status": "open", "pdfUrl": null},
+    {"id": "T-D05", "type": "invoice", "number": "DEMO-I-260005", "date": "2026-10-24", "customerId": "T-C01", "status": "issued", "pdfUrl": null}
+  ],
+  "warehouseMovements": [
+    {"id": "T-M01", "date": "2026-10-26", "articleId": "T-A01", "warehouse": "DEMO-WH", "inQty": 0, "outQty": 12, "unit": "m", "documentId": "T-D03"},
+    {"id": "T-M02", "date": "2026-10-20", "articleId": "T-A02", "warehouse": "DEMO-WH", "inQty": 20, "outQty": 0, "unit": "pcs", "documentId": null}
+  ]
+}
