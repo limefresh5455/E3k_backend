@@ -43,6 +43,9 @@ class DashboardSettings:
     publish_interval_seconds: int
     max_dataset_bytes: int
     archive_limit: int
+    s3_bucket: str
+    s3_region: str
+    s3_manifest_key: str
 
     @classmethod
     def from_env(cls) -> "DashboardSettings":
@@ -72,6 +75,9 @@ class DashboardSettings:
                 "WORKER_DASHBOARD_MAX_DATASET_BYTES", 25 * 1024 * 1024, 1024, 250 * 1024 * 1024
             ),
             archive_limit=_integer("WORKER_DASHBOARD_ARCHIVE_LIMIT", 24, 1, 500),
+            s3_bucket=os.getenv("S3_BUCKET", "e3k-backend").strip(),
+            s3_region=os.getenv("AWS_REGION", "eu-north-1").strip(),
+            s3_manifest_key=os.getenv("S3_MANIFEST_KEY", "current.json").strip(),
         )
 
     @property
@@ -83,3 +89,9 @@ class DashboardSettings:
             raise ValueError(
                 "CORS_ALLOWED_ORIGINS must list trusted HTTPS origins in production"
             )
+        if self.environment == "production" and not self.s3_bucket:
+            raise ValueError("S3_BUCKET is required in production")
+        if self.environment == "production" and not self.s3_region:
+            raise ValueError("AWS_REGION is required in production")
+        if self.environment == "production" and not self.s3_manifest_key:
+            raise ValueError("S3_MANIFEST_KEY is required in production")

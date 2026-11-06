@@ -157,8 +157,10 @@ class WorkerDataset(StrictModel):
 
         for row in self.salesQuantities:
             article = articles.get(row.articleId)
-            if article is None or article.unit != row.unit:
-                raise ValueError("sales quantity has an invalid article/unit reference")
+            if article is None:
+                raise ValueError("sales quantity references an unknown article")
+            # Europa preserves the unit used at transaction time. It can differ
+            # from the article's current master-data unit and must not be lost.
             if row.customerId not in customers:
                 raise ValueError("sales quantity references an unknown customer")
             if row.documentId is not None and row.documentId not in documents:
