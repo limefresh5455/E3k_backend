@@ -46,6 +46,17 @@ class DashboardSettings:
     s3_bucket: str
     s3_region: str
     s3_manifest_key: str
+    # --- S3 performance tuning (all optional; see from_env) -----------------
+    # How long the parsed S3 manifest is reused before it is downloaded again.
+    s3_manifest_ttl_seconds: int = 30
+    # Separate limits for the stored (compressed) object and for what it
+    # expands to.  They default to max_dataset_bytes (previous behaviour).
+    s3_max_compressed_bytes: int = 25 * 1024 * 1024
+    s3_max_decompressed_bytes: int = 25 * 1024 * 1024
+    # Share the processed dataset between Gunicorn workers through data_root.
+    s3_disk_cache: bool = True
+    # Parse S3 JSON incrementally (ijson) instead of one json.loads() call.
+    s3_incremental_parse: bool = True
 
     @classmethod
     def from_env(cls) -> "DashboardSettings":
@@ -62,6 +73,9 @@ class DashboardSettings:
         )
         if not configured_root.is_absolute():
             configured_root = PROJECT_ROOT / configured_root
+        max_dataset_bytes = _integer(
+            "WORKER_DASHBOARD_MAX_DATASET_BYTES", 25 * 1024 * 1024, 1024, 250 * 1024 * 1024
+        )
         return cls(
             environment=environment,
             data_root=configured_root.resolve(),
@@ -71,13 +85,28 @@ class DashboardSettings:
             publish_interval_seconds=_integer(
                 "WORKER_DASHBOARD_PUBLISH_INTERVAL_SECONDS", 300, 60, 3600
             ),
-            max_dataset_bytes=_integer(
-                "WORKER_DASHBOARD_MAX_DATASET_BYTES", 25 * 1024 * 1024, 1024, 250 * 1024 * 1024
-            ),
+            max_dataset_bytes=max_dataset_bytes,
             archive_limit=_integer("WORKER_DASHBOARD_ARCHIVE_LIMIT", 24, 1, 500),
             s3_bucket=os.getenv("S3_BUCKET", "e3k-backend").strip(),
             s3_region=os.getenv("AWS_REGION", "eu-north-1").strip(),
             s3_manifest_key=os.getenv("S3_MANIFEST_KEY", "current.json").strip(),
+            s3_manifest_ttl_seconds=_integer(
+                "WORKER_DASHBOARD_S3_MANIFEST_TTL_SECONDS", 30, 0, 600
+            ),
+            s3_max_compressed_bytes=_integer(
+                "WORKER_DASHBOARD_S3_MAX_COMPRESSED_BYTES",
+                max_dataset_bytes,
+                1024,
+                1024 * 1024 * 1024,
+            ),
+            s3_max_decompressed_bytes=_integer(
+                "WORKER_DASHBOARD_S3_MAX_DECOMPRESSED_BYTES",
+                max_dataset_bytes,
+                1024,
+                1024 * 1024 * 1024,
+            ),
+            s3_disk_cache=_boolean("WORKER_DASHBOARD_S3_DISK_CACHE", True),
+            s3_incremental_parse=_boolean("WORKER_DASHBOARD_S3_INCREMENTAL_PARSE", True),
         )
 
     @property
