@@ -22,6 +22,7 @@ from .constants import COMPANIES
 from .models import FinanceDataset, WorkerDataset
 from .schemas import DashboardConfigResponse, DashboardStatusResponse
 from .s3_dataset import S3WorkerDatasetError, S3WorkerDatasetStore
+from .s3_finance_dataset import S3FinanceDatasetStore
 from .storage import DatasetStore
 
 
@@ -42,6 +43,29 @@ def _no_store(response: Response) -> Response:
         "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
     )
     return response
+
+
+def _use_s3(settings: DashboardSettings) -> bool:
+    # Both worker and finance datasets come from S3 in production.
+    return settings.environment == "production"
+
+
+def _read_dataset(settings: DashboardSettings, audience: str, company: str) -> bytes:
+    if _use_s3(settings):
+        if audience == "worker":
+            return S3WorkerDatasetStore(settings).read(company)
+        if audience == "finance":
+            return S3FinanceDatasetStore(settings).read(company)
+    return DatasetStore(settings).read(audience, company)  # type: ignore[arg-type]
+
+
+def _dataset_status(settings: DashboardSettings, audience: str, company: str) -> dict:
+    if _use_s3(settings):
+        if audience == "worker":
+            return S3WorkerDatasetStore(settings).status(company)
+        if audience == "finance":
+            return S3FinanceDatasetStore(settings).status(company)
+    return DatasetStore(settings).status(audience, company)  # type: ignore[arg-type]
 
 
 @router.get(
@@ -87,10 +111,7 @@ def dashboard_data(
         raise HTTPException(status_code=404, detail="Dashboard dataset not found")
     require_resource_access(principal, audience=audience, company=company)
     try:
-        if audience == "worker" and settings.environment == "production":
-            raw = S3WorkerDatasetStore(settings).read(company)
-        else:
-            raw = DatasetStore(settings).read(audience, company)  # type: ignore[arg-type]
+        raw = _read_dataset(settings, audience, company)
     except (FileNotFoundError, S3WorkerDatasetError) as exc:
         logger.warning(
             "Dashboard data unavailable for %s/%s: %s",
@@ -116,13 +137,7 @@ def dashboard_status(
         raise HTTPException(status_code=404, detail="Dashboard dataset not found")
     require_resource_access(principal, audience=audience, company=company)
     try:
-        if audience == "worker" and settings.environment == "production":
-            status_payload = S3WorkerDatasetStore(settings).status(company)
-        else:
-            status_payload = DatasetStore(settings).status(  # type: ignore[arg-type]
-                audience,
-                company,
-            )
+        status_payload = _dataset_status(settings, audience, company)
     except S3WorkerDatasetError as exc:
         logger.warning(
             "Dashboard status unavailable for %s/%s: %s",
