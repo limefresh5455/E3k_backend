@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 
 from .access import (
@@ -21,6 +21,7 @@ from .config import DashboardSettings
 from .constants import COMPANIES
 from .models import FinanceDataset, WorkerDataset
 from .schemas import DashboardConfigResponse, DashboardStatusResponse
+from .s3_cache import CachedDataset
 from .s3_dataset import S3WorkerDatasetError, S3WorkerDatasetStore
 from .s3_finance_dataset import S3FinanceDatasetStore
 from .storage import DatasetStore
@@ -50,22 +51,61 @@ def _use_s3(settings: DashboardSettings) -> bool:
     return settings.environment == "production"
 
 
-def _read_dataset(settings: DashboardSettings, audience: str, company: str) -> bytes:
-    if _use_s3(settings):
-        if audience == "worker":
-            return S3WorkerDatasetStore(settings).read(company)
-        if audience == "finance":
-            return S3FinanceDatasetStore(settings).read(company)
-    return DatasetStore(settings).read(audience, company)  # type: ignore[arg-type]
+def _s3_store(settings: DashboardSettings, audience: str):
+    if audience == "finance":
+        return S3FinanceDatasetStore(settings)
+    return S3WorkerDatasetStore(settings)
 
 
 def _dataset_status(settings: DashboardSettings, audience: str, company: str) -> dict:
     if _use_s3(settings):
-        if audience == "worker":
-            return S3WorkerDatasetStore(settings).status(company)
-        if audience == "finance":
-            return S3FinanceDatasetStore(settings).status(company)
+        return _s3_store(settings, audience).status(company)
     return DatasetStore(settings).status(audience, company)  # type: ignore[arg-type]
+
+
+def _accepts_gzip(header: str | None) -> bool:
+    for part in (header or "").split(","):
+        name, _, params = part.strip().partition(";")
+        if name.strip().lower() not in {"gzip", "x-gzip", "*"}:
+            continue
+        quality = 1.0
+        for param in params.split(";"):
+            key, _, value = param.strip().partition("=")
+            if key.strip().lower() == "q":
+                try:
+                    quality = float(value)
+                except ValueError:
+                    quality = 0.0
+        if quality > 0:
+            return True
+    return False
+
+
+def _etag_matches(header: str | None, etag: str) -> bool:
+    if not header:
+        return False
+    wanted = etag.removeprefix("W/")
+    for candidate in header.split(","):
+        candidate = candidate.strip()
+        if candidate == "*" or candidate.removeprefix("W/") == wanted:
+            return True
+    return False
+
+
+def _cached_dataset_response(request: Request, cached: CachedDataset) -> Response:
+    """Serve the pre-compressed dataset; 304 when the client already has it."""
+
+    headers = {"ETag": cached.etag, "Vary": "Accept-Encoding"}
+    if _etag_matches(request.headers.get("if-none-match"), cached.etag):
+        return _no_store(Response(status_code=304, headers=headers))
+    if _accepts_gzip(request.headers.get("accept-encoding")):
+        headers["Content-Encoding"] = "gzip"
+        content = cached.gzip_body
+    else:
+        content = cached.json_bytes()
+    return _no_store(
+        Response(content=content, media_type="application/json", headers=headers)
+    )
 
 
 @router.get(
@@ -104,6 +144,7 @@ def dashboard_config(
 def dashboard_data(
     audience: str,
     company: str,
+    request: Request,
     principal: DashboardPrincipal = Depends(require_dashboard_principal),
     settings: DashboardSettings = Depends(get_settings),
 ):
@@ -111,7 +152,10 @@ def dashboard_data(
         raise HTTPException(status_code=404, detail="Dashboard dataset not found")
     require_resource_access(principal, audience=audience, company=company)
     try:
-        raw = _read_dataset(settings, audience, company)
+        if _use_s3(settings):
+            cached = _s3_store(settings, audience).read_cached(company)
+            return _cached_dataset_response(request, cached)
+        raw = DatasetStore(settings).read(audience, company)  # type: ignore[arg-type]
     except (FileNotFoundError, S3WorkerDatasetError) as exc:
         logger.warning(
             "Dashboard data unavailable for %s/%s: %s",
