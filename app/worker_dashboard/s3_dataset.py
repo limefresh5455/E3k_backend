@@ -1,140 +1,53 @@
-"""Read, verify and normalize compact worker datasets from S3."""
+"""Read, verify and normalize compact worker datasets from S3.
+
+The download / verification / caching flow lives in ``s3_cache`` (streamed and
+checksum-verified download, incremental parsing, shared cache between Gunicorn
+workers, manifest TTL cache).  This module only knows the worker export format
+and how to normalise it into the dashboard contract.
+"""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import gzip
-import hashlib
-import hmac
-from io import BytesIO
-import json
 import math
-from threading import Lock
 from typing import Any
 
-import boto3
-from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
-
-from .config import DashboardSettings
 from .constants import COMPANIES
 from .models import WorkerDataset
+from .s3_cache import S3DatasetStore
 
 
-MANIFEST_MAX_BYTES = 1024 * 1024
 WORKER_FORMAT = "europa3000-workers-v2"
-_CACHE_LOCK = Lock()
-_CACHE: dict[tuple[str, str, str], bytes] = {}
 
 
 class S3WorkerDatasetError(RuntimeError):
     """Raised when the selected S3 generation is unavailable or invalid."""
 
 
-class S3WorkerDatasetStore:
-    def __init__(
+class S3WorkerDatasetStore(S3DatasetStore):
+    audience = "worker"
+    manifest_prefix = "workers"
+    error_cls = S3WorkerDatasetError
+    gzip_mode = "require"
+
+    def _validate_key(self, key: str, company: str) -> None:
+        _validate_object_key(key, company)
+
+    def _build_payload(
         self,
-        settings: DashboardSettings,
-        s3_client=None,
-    ):
-        self.settings = settings
-        self.s3 = s3_client or boto3.client(
-            "s3",
-            region_name=settings.s3_region,
-            config=Config(
-                signature_version="s3v4",
-                connect_timeout=5,
-                read_timeout=60,
-                retries={"max_attempts": 3, "mode": "standard"},
-            ),
-        )
-
-    def read(self, company: str) -> bytes:
-        manifest, entry = self._manifest_entry(company)
-        object_key = _required_text(entry, "key")
-        expected_digest = _required_sha256(entry.get("sha256"))
-        _validate_object_key(object_key, company)
-
-        cache_key = (self.settings.s3_bucket, object_key, expected_digest)
-        with _CACHE_LOCK:
-            cached = _CACHE.get(cache_key)
-        if cached is not None:
-            return cached
-
-        response = self._get_object(object_key, "worker object")
-        compressed = _read_stream_limited(
-            response.get("Body"),
-            self.settings.max_dataset_bytes,
-            "S3 worker object",
-        )
-        actual_digest = hashlib.sha256(compressed).hexdigest()
-        if not hmac.compare_digest(actual_digest, expected_digest):
-            raise S3WorkerDatasetError("S3 worker object checksum does not match manifest")
-
-        decoded = _decompress_limited(
-            compressed,
-            self.settings.max_dataset_bytes,
-        )
-        source = _parse_object(decoded)
-        normalized = normalize_worker_dataset(
+        source: dict[str, Any],
+        *,
+        company: str,
+        entry: dict[str, Any],
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        return normalize_worker_dataset(
             source,
             company=company,
-            source_fetched_at=_required_text(entry, "sourceFetchedAt"),
+            source_fetched_at=_text(entry.get("sourceFetchedAt")),
             published_at=_optional_text(manifest.get("publishedAt")),
+            consume=True,
         )
-        canonical = json.dumps(
-            normalized,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-
-        with _CACHE_LOCK:
-            # Four entries cover worker datasets for both configured companies
-            # across a rolling generation without allowing unbounded growth.
-            if len(_CACHE) >= 4:
-                _CACHE.clear()
-            _CACHE[cache_key] = canonical
-        return canonical
-
-    def status(self, company: str) -> dict[str, Any]:
-        payload = json.loads(self.read(company))
-        source = payload["source"]
-        return {
-            "audience": "worker",
-            "company": company,
-            "status": source["status"],
-            "source_as_of": source["asOf"],
-            "source_exported_at": source["exportedAt"],
-        }
-
-    def _manifest_entry(self, company: str) -> tuple[dict[str, Any], dict[str, Any]]:
-        response = self._get_object(self.settings.s3_manifest_key, "manifest")
-        raw = _read_stream_limited(
-            response.get("Body"),
-            MANIFEST_MAX_BYTES,
-            "S3 manifest",
-        )
-        try:
-            manifest = json.loads(raw.decode("utf-8"))
-            entry = manifest["objects"][f"workers/{company}"]
-        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as error:
-            raise S3WorkerDatasetError(
-                f"S3 manifest has no valid workers/{company} entry"
-            ) from error
-        if not isinstance(manifest, dict) or not isinstance(entry, dict):
-            raise S3WorkerDatasetError("S3 manifest worker entry is invalid")
-        return manifest, entry
-
-    def _get_object(self, key: str, label: str) -> dict[str, Any]:
-        try:
-            return self.s3.get_object(
-                Bucket=self.settings.s3_bucket,
-                Key=key,
-            )
-        except (BotoCoreError, ClientError) as error:
-            raise S3WorkerDatasetError(
-                f"Could not read S3 dashboard {label}"
-            ) from error
 
 
 def normalize_worker_dataset(
@@ -143,8 +56,15 @@ def normalize_worker_dataset(
     company: str,
     source_fetched_at: str,
     published_at: str | None,
+    consume: bool = False,
 ) -> dict[str, Any]:
-    """Expand the verified v2 worker export into the dashboard API contract."""
+    """Expand the verified v2 worker export into the dashboard API contract.
+
+    With ``consume=True`` the large source row lists are emptied as soon as they
+    have been converted, so the source and the normalised copy never both exist
+    in full.  The result is identical either way; the caller must not reuse
+    ``source`` afterwards.
+    """
 
     if company not in COMPANIES:
         raise S3WorkerDatasetError("Unsupported dashboard company")
@@ -166,6 +86,11 @@ def normalize_worker_dataset(
     movements_source = _rows(source, "movements")
     as_of_date = _date(source.get("asof"))
     history_from = _date(source.get("cutoff"))
+    product_count = len(products_source)
+
+    def release(rows: list) -> None:
+        if consume:
+            rows.clear()
 
     customers = [
         {
@@ -176,6 +101,7 @@ def normalize_worker_dataset(
         for index, row in enumerate(customers_source)
         if _require_width(row, 2, "customer")
     ]
+    release(customers_source)
 
     group_names = {
         _text(row[0]): _nonempty(row[1], _text(row[0]))
@@ -195,7 +121,7 @@ def normalize_worker_dataset(
     historical_units: dict[int, str] = {}
     for row in sales_source:
         _require_width(row, 7, "sales quantity")
-        product_index = _index(row[2], len(products_source), "sales product")
+        product_index = _index(row[2], product_count, "sales product")
         unit = _text(row[6])
         if unit:
             historical_units.setdefault(product_index, unit)
@@ -252,6 +178,10 @@ def normalize_worker_dataset(
             }
         )
 
+    release(products_source)
+    release(articles_source)
+    master_by_number.clear()
+
     sales_quantities = []
     for row in sales_source:
         _require_width(row, 7, "sales quantity")
@@ -259,7 +189,7 @@ def normalize_worker_dataset(
         if not history_from <= row_date <= as_of_date:
             continue
         customer_index = _index(row[1], len(customers), "sales customer")
-        product_index = _index(row[2], len(products_source), "sales product")
+        product_index = _index(row[2], product_count, "sales product")
         sales_quantities.append(
             {
                 "date": row_date,
@@ -270,6 +200,8 @@ def normalize_worker_dataset(
                 "documentId": None,
             }
         )
+
+    release(sales_source)
 
     documents = []
     for row in documents_source:
@@ -294,13 +226,15 @@ def normalize_worker_dataset(
             }
         )
 
+    release(documents_source)
+
     warehouse_movements = []
     for row in movements_source:
         _require_width(row, 7, "warehouse movement")
         row_date = _date(row[0])
         if not history_from <= row_date <= as_of_date:
             continue
-        product_index = _index(row[1], len(products_source), "movement product")
+        product_index = _index(row[1], product_count, "movement product")
         warehouse_index = _index(
             row[2], len(warehouse_names), "movement warehouse"
         )
@@ -318,6 +252,8 @@ def normalize_worker_dataset(
                 "documentId": None,
             }
         )
+
+    release(movements_source)
 
     exported_at = _utc_timestamp(source_fetched_at or published_at)
     normalized = {
@@ -343,68 +279,33 @@ def normalize_worker_dataset(
         "warehouseMovements": warehouse_movements,
     }
     try:
-        return WorkerDataset.model_validate(normalized).model_dump(mode="json")
+        model = WorkerDataset.model_validate(normalized)
+        # Only the small header needs pydantic's JSON form; the row sections
+        # already are plain JSON types, so a second full copy is not created.
+        result = model.model_dump(
+            mode="json",
+            include={"schemaVersion", "audience", "isSample", "company", "source"},
+        )
+        del model
     except Exception as error:
         raise S3WorkerDatasetError(
             f"S3 worker dataset does not satisfy dashboard contract: {error}"
         ) from error
-
-
-def _read_stream_limited(body, maximum: int, label: str) -> bytes:
-    if body is None or not hasattr(body, "read"):
-        raise S3WorkerDatasetError(f"{label} has no readable body")
-    try:
-        raw = body.read(maximum + 1)
-    except (BotoCoreError, OSError) as error:
-        raise S3WorkerDatasetError(f"Could not read {label} body") from error
-    if len(raw) > maximum:
-        raise S3WorkerDatasetError(f"{label} exceeds configured size limit")
-    return raw
-
-
-def _decompress_limited(compressed: bytes, maximum: int) -> bytes:
-    if not compressed.startswith(b"\x1f\x8b"):
-        raise S3WorkerDatasetError("S3 worker object is not gzip encoded")
-    try:
-        with gzip.GzipFile(fileobj=BytesIO(compressed)) as archive:
-            decoded = archive.read(maximum + 1)
-    except (OSError, EOFError) as error:
-        raise S3WorkerDatasetError("S3 worker object is not valid gzip data") from error
-    if len(decoded) > maximum:
-        raise S3WorkerDatasetError(
-            "Decompressed S3 worker object exceeds configured size limit"
-        )
-    return decoded
-
-
-def _parse_object(raw: bytes) -> dict[str, Any]:
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise S3WorkerDatasetError("S3 worker object is not valid UTF-8 JSON") from error
-    if not isinstance(payload, dict):
-        raise S3WorkerDatasetError("S3 worker JSON root must be an object")
-    return payload
+    for section in (
+        "customers",
+        "articles",
+        "salesQuantities",
+        "documents",
+        "warehouseMovements",
+    ):
+        result[section] = normalized.pop(section)
+    return result
 
 
 def _validate_object_key(key: str, company: str) -> None:
     expected_suffix = f"/workers/{company}.json.gz"
     if not key.startswith("generations/") or ".." in key or not key.endswith(expected_suffix):
         raise S3WorkerDatasetError("S3 manifest contains an unexpected worker key")
-
-
-def _required_sha256(value: Any) -> str:
-    text = _text(value).lower()
-    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
-        raise S3WorkerDatasetError("S3 manifest contains an invalid SHA-256 value")
-    return text
-
-
-def _required_text(mapping: dict[str, Any], key: str) -> str:
-    value = _text(mapping.get(key))
-    if not value:
-        raise S3WorkerDatasetError(f"S3 manifest entry is missing {key}")
-    return value
 
 
 def _optional_text(value: Any) -> str | None:
