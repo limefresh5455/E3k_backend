@@ -353,6 +353,26 @@ def _calculate_low_price_sales_price(
     )
 
 
+def _apply_stock_factor_to_sales_price(
+    sales_price: float,
+    stock_factor: float,
+) -> float:
+    try:
+        price = Decimal(str(sales_price))
+        factor = Decimal(str(stock_factor))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError("Sales price and stock factor must be valid numbers.") from error
+
+    if price <= 0:
+        raise ValueError("Calculated sales price must be greater than zero.")
+    if factor <= 0:
+        raise ValueError(
+            f"Faktor Lagerbestand ({MCC_STOCK_FACTOR_FIELD}) must be greater than zero."
+        )
+
+    return float((price / factor).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
 def _unit_factor(pdf_line: dict) -> float:
     """
     Some suppliers quote a price per pack/base unit (e.g. Einheit=100),
@@ -665,6 +685,47 @@ def _get_mcc_pricing_context(supplier_no: str, article_no: str) -> dict[str, flo
         "vat_code": configured_vat_code,
         "vat_percent": vat_percent,
     }
+
+
+def _get_supplier_article_stock_factor(supplier_no: str, article_no: str) -> float:
+    supplier_no = str(supplier_no or "").strip()
+    article_no = str(article_no or "").strip()
+    if not supplier_no or not article_no:
+        raise ValueError("Supplier and ERP article numbers are required for stock factor lookup.")
+
+    response = _erp_request(
+        "POST",
+        f"{ERP_BASE_URL}/api/SupplierArticle/Custom",
+        context=f"SupplierArticle/Custom stock factor (article={article_no})",
+        json={
+            "Fields": [MCC_STOCK_FACTOR_FIELD],
+            "Filters": [
+                {"FieldNumber": 1, "Value": supplier_no, "Combine": 1, "Type": 1},
+                {"FieldNumber": 2, "Value": article_no, "Combine": 1, "Type": 1},
+            ],
+        },
+        auth=_auth(),
+    )
+    if not response.ok:
+        raise Exception(
+            f"ERP SupplierArticle stock factor lookup failed ({response.status_code}) "
+            f"for article '{article_no}': {response.text[:500]}"
+        )
+
+    rows = response.json()
+    if not isinstance(rows, list) or len(rows) != 1:
+        raise ValueError(
+            f"Expected one SupplierArticle record for supplier '{supplier_no}' and "
+            f"article '{article_no}', received {len(rows) if isinstance(rows, list) else 0}."
+        )
+
+    factor = _as_float(rows[0].get(MCC_STOCK_FACTOR_FIELD), default=0.0)
+    if factor <= 0:
+        raise ValueError(
+            f"Faktor Lagerbestand ({MCC_STOCK_FACTOR_FIELD}) must be greater than zero "
+            f"for article '{article_no}'."
+        )
+    return factor
 
 
 def _pick_best_erp_line(
@@ -1123,6 +1184,7 @@ def push_to_erp(extracted: dict) -> dict:
     mcc_sales_price_error_lines: list[dict] = []
     mcc_sales_price_updates: dict[str, dict[str, float | str]] = {}
     mcc_pricing_contexts: dict[str, dict[str, float | str]] = {}
+    supplier_stock_factors: dict[str, float] = {}
     updated_line_totals: dict[str, float] = {}
     updated_line_quantities: dict[str, float] = {}
     updated_line_erp_article_numbers: dict[str, str] = {}
@@ -1305,6 +1367,17 @@ def push_to_erp(extracted: dict) -> dict:
             if uses_low_price_sales_rule
             else None
         )
+        if supplier_sales_price_net is not None:
+            stock_factor = supplier_stock_factors.get(erp_article_number)
+            if stock_factor is None:
+                stock_factor = _get_supplier_article_stock_factor(
+                    supplier_no, erp_article_number
+                )
+                supplier_stock_factors[erp_article_number] = stock_factor
+            supplier_sales_price_net = _apply_stock_factor_to_sales_price(
+                supplier_sales_price_net,
+                stock_factor,
+            )
         voucher_line_sales_price_net = (
             mcc_sales_prices["net"]
             if has_valid_mcc_sales_prices
